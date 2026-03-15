@@ -1,0 +1,489 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>A Special Quiz For You 💕</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    min-height: 100vh;
+    background: linear-gradient(135deg, #ff6b9d, #ff8e53, #ffc0cb);
+    font-family: 'Segoe UI', sans-serif;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+    overflow: hidden;
+  }
+
+  .card {
+    background: rgba(255,255,255,0.97);
+    border-radius: 28px;
+    padding: 36px 28px;
+    max-width: 420px;
+    width: 100%;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.18);
+    text-align: center;
+    position: relative;
+    animation: popIn 0.5s cubic-bezier(.17,.67,.35,1.3);
+  }
+
+  @keyframes popIn {
+    from { transform: scale(0.8); opacity: 0; }
+    to { transform: scale(1); opacity: 1; }
+  }
+
+  .emoji-top { font-size: 52px; margin-bottom: 8px; }
+
+  .quiz-label {
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 2px;
+    color: #ff6b9d;
+    text-transform: uppercase;
+    margin-bottom: 6px;
+  }
+
+  .progress-wrap {
+    background: #fce4ec;
+    border-radius: 99px;
+    height: 8px;
+    margin: 14px 0 22px;
+    overflow: hidden;
+  }
+
+  .progress-bar {
+    height: 100%;
+    background: linear-gradient(90deg, #ff6b9d, #ff8e53);
+    border-radius: 99px;
+    transition: width 0.4s ease;
+  }
+
+  .question-num {
+    font-size: 13px;
+    color: #aaa;
+    margin-bottom: 10px;
+  }
+
+  .question {
+    font-size: 22px;
+    font-weight: 700;
+    color: #333;
+    line-height: 1.4;
+    margin-bottom: 32px;
+    min-height: 80px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .btn-wrap {
+    display: flex;
+    gap: 16px;
+    justify-content: center;
+    align-items: center;
+    position: relative;
+    min-height: 60px;
+  }
+
+  .btn {
+    padding: 14px 40px;
+    border-radius: 99px;
+    border: none;
+    font-size: 18px;
+    font-weight: 700;
+    cursor: pointer;
+    transition: transform 0.15s, box-shadow 0.15s;
+    letter-spacing: 1px;
+  }
+
+  .btn-yes {
+    background: linear-gradient(135deg, #ff6b9d, #ff8e53);
+    color: white;
+    box-shadow: 0 6px 20px rgba(255,107,157,0.4);
+  }
+
+  .btn-yes:active { transform: scale(0.95); }
+
+  .btn-no {
+    background: #f5f5f5;
+    color: #aaa;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.08);
+    position: absolute;
+    transition: none;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
+  /* Celebration screen */
+  .celebration { display: none; }
+  .celebration.active {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  .confetti-title {
+    font-size: 28px;
+    font-weight: 800;
+    color: #ff6b9d;
+    margin: 10px 0 6px;
+    line-height: 1.3;
+  }
+
+  .congrats-sub {
+    font-size: 15px;
+    color: #777;
+    margin-bottom: 20px;
+    line-height: 1.5;
+  }
+
+  /* Ticket */
+  .ticket {
+    background: linear-gradient(135deg, #1a1a2e, #16213e);
+    border-radius: 20px;
+    width: 100%;
+    max-width: 360px;
+    overflow: hidden;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.25);
+    position: relative;
+  }
+
+  .ticket-top {
+    padding: 22px 24px 18px;
+    position: relative;
+  }
+
+  .ticket-badge {
+    display: inline-block;
+    background: #ff6b9d;
+    color: white;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 2px;
+    padding: 4px 12px;
+    border-radius: 99px;
+    margin-bottom: 10px;
+    text-transform: uppercase;
+  }
+
+  .ticket-event {
+    font-size: 24px;
+    font-weight: 800;
+    color: white;
+    line-height: 1.2;
+    margin-bottom: 4px;
+  }
+
+  .ticket-comedian {
+    font-size: 14px;
+    color: #ff8e53;
+    font-weight: 600;
+    margin-bottom: 16px;
+  }
+
+  .ticket-img-wrap {
+    width: 100%;
+    height: 160px;
+    background: rgba(255,255,255,0.07);
+    border-radius: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    cursor: pointer;
+    border: 2px dashed rgba(255,255,255,0.2);
+    position: relative;
+    margin-bottom: 18px;
+    transition: border-color 0.2s;
+  }
+
+  .ticket-img-wrap:hover { border-color: #ff6b9d; }
+
+  .ticket-img-wrap img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    border-radius: 10px;
+  }
+
+  .img-placeholder {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    color: rgba(255,255,255,0.4);
+    font-size: 13px;
+    gap: 8px;
+    pointer-events: none;
+  }
+
+  .img-placeholder span { font-size: 32px; }
+
+  #imgInput { display: none; }
+
+  .ticket-divider {
+    display: flex;
+    align-items: center;
+    gap: 0;
+    margin: 0 -0px;
+  }
+
+  .divider-line { flex: 1; height: 1px; background: rgba(255,255,255,0.1); }
+  .divider-circle-left,
+  .divider-circle-right {
+    width: 20px; height: 20px;
+    background: linear-gradient(135deg, #ff6b9d, #ff8e53);
+    border-radius: 50%;
+  }
+
+  .ticket-bottom {
+    padding: 16px 24px 20px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+
+  .ticket-info { text-align: left; }
+  .ticket-info-label { font-size: 10px; color: rgba(255,255,255,0.4); letter-spacing: 1px; text-transform: uppercase; }
+  .ticket-info-val { font-size: 14px; color: white; font-weight: 700; margin-top: 2px; }
+
+  .ticket-seat {
+    background: rgba(255,255,255,0.08);
+    border-radius: 10px;
+    padding: 8px 16px;
+    text-align: center;
+  }
+
+  .ticket-seat .ticket-info-val { font-size: 22px; color: #ff6b9d; }
+
+  .hearts {
+    position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+    pointer-events: none; overflow: hidden; z-index: 0;
+  }
+
+  .heart {
+    position: absolute;
+    font-size: 20px;
+    animation: floatUp 4s ease-in forwards;
+    opacity: 0;
+  }
+
+  @keyframes floatUp {
+    0% { transform: translateY(100vh) scale(0.5); opacity: 1; }
+    80% { opacity: 1; }
+    100% { transform: translateY(-10vh) scale(1.2); opacity: 0; }
+  }
+
+  .quiz-section { width: 100%; }
+
+  .checkmark-anim {
+    width: 60px; height: 60px;
+    background: linear-gradient(135deg, #ff6b9d, #ff8e53);
+    border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 28px;
+    margin: 0 auto 14px;
+    animation: popIn 0.4s cubic-bezier(.17,.67,.35,1.3);
+  }
+</style>
+</head>
+<body>
+
+<div class="hearts" id="hearts"></div>
+
+<div class="card">
+  <!-- QUIZ SECTION -->
+  <div class="quiz-section" id="quizSection">
+    <div class="emoji-top">💕</div>
+    <div class="quiz-label">A Special Quiz For You</div>
+    <div class="progress-wrap">
+      <div class="progress-bar" id="progressBar" style="width:0%"></div>
+    </div>
+    <div class="question-num" id="qNum">Question 1 of 5</div>
+    <div class="question" id="qText"></div>
+    <div class="btn-wrap" id="btnWrap">
+      <button class="btn btn-yes" onclick="handleYes()">YES 💖</button>
+      <button class="btn btn-no" id="noBtn" onmouseenter="runAway()" ontouchstart="runAway()">NO</button>
+    </div>
+  </div>
+
+  <!-- CELEBRATION SECTION -->
+  <div class="celebration" id="celebSection">
+    <div style="font-size:60px; animation: popIn 0.5s ease;">🎉</div>
+    <div class="confetti-title">Congratulations!</div>
+    <p class="congrats-sub">You've been an amazing sport! Now here's your reward… 🎁</p>
+
+    <div class="ticket">
+      <div class="ticket-top">
+        <div class="ticket-badge">🎟 Live Event</div>
+        <div class="ticket-event">Stand-Up Comedy Night</div>
+        <div class="ticket-comedian">✨ Munawar Faruqui Live</div>
+
+        <label for="imgInput">
+          <div class="ticket-img-wrap" id="imgWrap">
+            <div class="img-placeholder" id="imgPlaceholder">
+              <span>📸</span>
+              Tap to add a photo
+            </div>
+          </div>
+        </label>
+        <input type="file" id="imgInput" accept="image/*" onchange="loadImg(event)">
+      </div>
+
+      <div class="ticket-divider">
+        <div class="divider-circle-left"></div>
+        <div class="divider-line"></div>
+        <div class="divider-circle-right"></div>
+      </div>
+
+      <div class="ticket-bottom">
+        <div class="ticket-info">
+          <div class="ticket-info-label">Date</div>
+          <div class="ticket-info-val">18 April 2026</div>
+        </div>
+        <div class="ticket-info">
+          <div class="ticket-info-label">Time</div>
+          <div class="ticket-info-val">6:00 PM</div>
+        </div>
+        <div class="ticket-seat">
+          <div class="ticket-info-label">Seats</div>
+          <div class="ticket-info-val">2 🎟</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  const questions = [
+    "Promise you will never fight with your husband again? 🙏",
+    "Do you agree your husband is always right? 😇",
+    "Will you stop overthinking and be a good girl from now on? 🛌",
+    "Do you admit you won't even think about marraige if not with rafi? 😏",
+    "Are you ready for the small surprise? 🎉"
+  ];
+
+  let current = 0;
+  let noMoving = false;
+
+  const qText = document.getElementById('qText');
+  const qNum = document.getElementById('qNum');
+  const progressBar = document.getElementById('progressBar');
+  const noBtn = document.getElementById('noBtn');
+  const btnWrap = document.getElementById('btnWrap');
+
+  function loadQuestion() {
+    qText.style.opacity = 0;
+    setTimeout(() => {
+      qText.textContent = questions[current];
+      qNum.textContent = `Question ${current + 1} of ${questions.length}`;
+      progressBar.style.width = `${(current / questions.length) * 100}%`;
+      qText.style.transition = 'opacity 0.3s';
+      qText.style.opacity = 1;
+      resetNo();
+    }, 200);
+  }
+
+  function resetNo() {
+    noBtn.style.position = 'absolute';
+    noBtn.style.left = '';
+    noBtn.style.top = '';
+    noBtn.style.transform = '';
+    noBtn.style.right = '0';
+    noBtn.style.bottom = '0';
+    noMoving = false;
+  }
+
+  function handleYes() {
+    current++;
+    if (current < questions.length) {
+      // quick flash
+      btnWrap.style.opacity = 0;
+      setTimeout(() => {
+        btnWrap.style.transition = 'opacity 0.3s';
+        btnWrap.style.opacity = 1;
+        loadQuestion();
+      }, 200);
+    } else {
+      progressBar.style.width = '100%';
+      setTimeout(showCelebration, 400);
+    }
+  }
+
+  function runAway() {
+    if (noMoving) return;
+    noMoving = true;
+
+    const wrap = btnWrap.getBoundingClientRect();
+    const btn = noBtn.getBoundingClientRect();
+
+    // Random position within the card area, staying somewhat visible
+    const maxX = wrap.width - btn.width - 10;
+    const maxY = wrap.height - btn.height + 20;
+
+    const randX = Math.floor(Math.random() * maxX);
+    const randY = Math.floor(Math.random() * 80) - 40;
+
+    noBtn.style.position = 'absolute';
+    noBtn.style.right = 'auto';
+    noBtn.style.bottom = 'auto';
+    noBtn.style.left = randX + 'px';
+    noBtn.style.top = (btn.top - wrap.top + randY) + 'px';
+    noBtn.style.transition = 'left 0.25s ease, top 0.25s ease';
+
+    setTimeout(() => { noMoving = false; }, 300);
+  }
+
+  // Extra: move no when clicking anywhere near it on mobile
+  document.addEventListener('touchmove', function(e) {
+    const t = e.touches[0];
+    const nb = noBtn.getBoundingClientRect();
+    const dist = Math.hypot(t.clientX - (nb.left + nb.width/2), t.clientY - (nb.top + nb.height/2));
+    if (dist < 80) runAway();
+  });
+
+  function showCelebration() {
+    document.getElementById('quizSection').style.display = 'none';
+    const cel = document.getElementById('celebSection');
+    cel.classList.add('active');
+    launchHearts();
+  }
+
+  function launchHearts() {
+    const container = document.getElementById('hearts');
+    const emojis = ['❤️','💕','💖','💗','🎉','✨','🎊','💝'];
+    let count = 0;
+    const interval = setInterval(() => {
+      const h = document.createElement('div');
+      h.className = 'heart';
+      h.textContent = emojis[Math.floor(Math.random() * emojis.length)];
+      h.style.left = Math.random() * 100 + 'vw';
+      h.style.animationDuration = (2.5 + Math.random() * 2) + 's';
+      h.style.animationDelay = (Math.random() * 0.5) + 's';
+      h.style.fontSize = (14 + Math.random() * 18) + 'px';
+      container.appendChild(h);
+      setTimeout(() => h.remove(), 5000);
+      if (++count > 40) clearInterval(interval);
+    }, 100);
+  }
+
+  function loadImg(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = function(ev) {
+      const wrap = document.getElementById('imgWrap');
+      wrap.innerHTML = `<img src="${ev.target.result}" alt="event photo">`;
+    };
+    reader.readAsDataURL(file);
+  }
+
+  // Init
+  loadQuestion();
+</script>
+</body>
+</html>
