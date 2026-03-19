@@ -1,0 +1,1702 @@
+CREATE OR REPLACE PROCEDURE `dip-gcp-myratefinder-prod.MRF_Payer_Extract.mrf_analytical_final_extract_load_client_delivery_rls_5_1`(client_name STRING, billing_class ARRAY<STRING>, use_komodo BOOL, run_rc_to_drg BOOL, tin_npi_priority STRING, standardize_billing_code_flag BOOL)
+BEGIN
+
+/*
+--changelogs: 
+pranav - 2/2/2024 - Moved final extract logic from complete load sp to final extract load stored proc
+Ravi - 2/7/2024 - Added a parameter to toggle the use of Komodo data
+ashwarya- - 2/8/2024 - updated the logic to fetch reference data based on the date on which the payer file was published i.e last_updated_on is in between version_open_date and version_close_date
+pranav- added 'create or replace' and 'drop table'
+pranav- 2/21/2024- added lower(negotiated_type)
+uday -4/24/2024 - added logic to load hospital analytical layer data to consolidated final extract
+Ravi - 5/7/2024 - Implemented hierarchy for payer and provider files and payer plan mapping
+Ravi - 5/23/2024 - Fixed the issue with combining the payer and provider data
+Uday -5/30/2024 - Changed the logic of rate_array for provider data and added logic to exclude null rates from final consolidated extract
+Ravi - 6/3/2024 - create top codes flag in final extract
+Ravi - 6/4/2024 - create a flag for shoppable services
+Ravi - 6/10/2024 - bring the region and priority for each hospital
+Uday - 6/26/2024 -Added client_payer_name and client_plan_name to the final extract 
+Ravi- 7/12/2024 - implemented the new additional information fields
+Ravi - 10/3/2024 - revert the client mapped payer plan mapping changes
+Anshul - 10/10/2024 - Changing the logic for outlier confidence from zscore to median
+Anshul - 10/14/2024 - Corrected the outlier confidence logic
+Anshul - 10/30/2024 - Enahcned the outlier confidence logic to consider the billinng type as well
+Ashwarya - 11/06/2024 - added the logic to tranform billing code and change negotiated type for them to mrf adjusted, added it along with 5195 branch
+Anshul - 11/06/2024 - Fixing Outlier confidence error and adding iqvia bus nm logic
+Ashwarya - 11/17/2024 - added logic for plan_name_level_2, mrf_mapped_plan_name_level_2 and client_mapped_plan_name_level_2, and added plan_name_level_2
+Uday - 11/27/2024 - Added filter to exclude records when stndrd_ngtd_charge_prcntg is null for percentage records
+Anshul - 12/03/2024 - Updated the logic to calculate the negotiated rate and type inside median calculation
+Ravi - 12/20/2024 - Fix the outlier confidence logic and the dropping of files when same business name appears in multiple provider files
+Uday - 01/06/2025  - Added logic to include MRF Adjuted rates to calculate outlier confidence
+Uday - 01/08/2025  - Updated query to include additional_payer_notes in final extract
+Ravi - 01/16/2025 - Updated logic to fetch payer plan mappings for provider files from the payer analytical dataset instead of hospital analytical dataset
+Ashwarya - 01/20/2025  - Updated the logic for current_medicare_allowed_amt and trended it forward to 25
+Uday - 01/21/2025 - Added code to adjust rates for Mapped billing codes
+Ashwarya - 02/11/2025 - updated the average los temp table with latest los rfrnc table
+Ravi - 2/19/2025 - Updated logic to fetch payer plan mappings for hospital files using the state along with source payer and plan name
+Anshul - 02/20/2025 - Addition of new column anomalous_rate_flag in final extract table which will be populated using Dbscan Algorithm
+Anshul - 02/20/2025 - Modifying the median table logic to handle records which is missing in the median table
+Ravi - 03/10/2025 - Updated the stored proc to handle both MRF Adjusted (Percentage) and the new Adjusted (Percentage) negotiated type
+Ashwarya - 03/05/2025 - added logic to get the mrf_mapped desciprtions from ES team custom mapping
+Ashwarya - 4/24/2025 - Added two call statements to save old final_extract version and to create a audit table for it.
+Ravi - 5/28/2025 - Add adjustment of per diem rates using cms or komodo los data depending on plan type
+Anshul - 06/04/2025 - Adding the new variable in final extract to control the calling of new stored proc rc_to_drg which add new drg record in final_extract table
+Anshul - 06/04/2025 - Adding updated confidence logic for outlier confidence same as es team 
+Ravi - 07/29/2025 - Add a parameter to handle both tin and npi based records
+Anshul - 08/08/2025 - CPT/HCPCS standarization and fixing the joining conditions
+Bhoomika - 08/21/2025 - Create a flag for cpt/hcpcs standarization
+Bhoomika - 08/27/2025 - Added raw_payer_name and raw_plan_name columns
+Bhoomika - 09/17/2025 - gross_Charge column added and logic 
+Anshul - 10/23/2025  - Fixing the union all issue for combined temp table to handle column mismatch issue  and dynamic gross charge calculation
+*/
+
+  -- Set default value if parameter is NULL
+  IF run_rc_to_drg IS NULL THEN
+    SET run_rc_to_drg = FALSE;
+  END IF;
+
+  -- Set default value for tin_npi_priority if not a valid value
+  IF lower(tin_npi_priority) not in ('tin', 'npi', 'both') THEN
+    SET tin_npi_priority = 'both';  -- Default to both if invalid value
+  ELSE
+    SET tin_npi_priority = lower(tin_npi_priority);  -- Ensure it's lowercase
+  END IF;
+
+for row in (select lower(billing_class_value) as billing_class_value from unnest(billing_class) billing_class_value where lower(billing_class_value) != 'both')
+do
+
+--- Get file & rate details
+execute immediate """create or replace temp table ngtd_prc_"""||row.billing_class_value||""" as (
+select distinct inn_payer_file_group_id,  mrf_payer_name, raw_payer_name, mrf_plan_name, mrf_plan_name_level_2, raw_plan_name, billing_code_type, ngtd.billing_code, billing_code_description, billing_code_category_level1, billing_code_category_level2, negotiated_rate, negotiated_type, negotiation_arrangement, inn_negotiated_rate_id, inn_ngtd_prc_id , inn_month, inn_year,last_updated_on, additional_information,cast(null as string) as additional_payer_notes, 
+load_dtm
+from (
+select distinct inn_id, inn_negotiated_rate_id, inn_ngtd_prc_id, billing_code_type, billing_code, negotiated_rate, negotiated_type, negotiation_arrangement, additional_information
+from `MRF_Payer_Analytical_"""||client_name||""".mrf_analytical_inn_ngtd_prc`
+-- filter on the billing class (institutional/professional)
+where billing_class in ('"""||row.billing_class_value||"""','both')
+and lower(negotiated_type) not like 'mrf adjusted%per diem%'
+) ngtd
+join (
+select distinct inn_id, inn_payer_file_group_id,  coalesce(client_mapped_payer_name, mrf_mapped_payer_name, mrf_payer_name) as mrf_payer_name, mrf_payer_name as raw_payer_name, coalesce(client_mapped_plan_name, mrf_mapped_plan_name, mrf_plan_name) as mrf_plan_name,coalesce(client_mapped_plan_name_level_2, mrf_mapped_plan_name_level_2, mrf_plan_name) as mrf_plan_name_level_2, mrf_plan_name as raw_plan_name, last_updated_on,
+CASE EXTRACT(MONTH FROM last_updated_on)
+    WHEN 1 THEN 'January'
+    WHEN 2 THEN 'February'
+    WHEN 3 THEN 'March'
+    WHEN 4 THEN 'April' 
+    WHEN 5 THEN 'May'
+    WHEN 6 THEN 'June'
+    WHEN 7 THEN 'July'
+    WHEN 8 THEN 'August'
+    WHEN 9 THEN 'September'
+    WHEN 10 THEN 'October'
+    WHEN 11 THEN 'November'
+    WHEN 12 THEN 'December'
+END AS inn_month,
+EXTRACT(YEAR FROM last_updated_on) AS inn_year,
+load_dtm,
+from `MRF_Payer_Analytical_"""||client_name||""".mrf_analytical_inn`
+--- get the payer/plan mapping
+left join MRF_Payer_Analytical_"""||client_name||""".mrf_analytical_payer_plan_mapping
+on mrf_payer_name = source_payer_name
+and mrf_plan_name = source_plan_name 
+and data_source = 'payer'  /* only bring payer file mappings */
+) inn
+using (inn_id)
+left join (
+select distinct billing_code, coalesce(mrf_mapped_billing_code_long_desc, billing_code_long_desc) as billing_code_description, coalesce(mrf_mapped_billing_code_category_level1, billing_code_category_level1) as billing_code_category_level1, coalesce(mrf_mapped_billing_code_category_level2, billing_code_category_level2) as billing_code_category_level2,version_open_date,version_close_date
+from `MRF_Payer_Reference.mrf_rfrnc_billing_code_dtls` 
+) map
+on ngtd.billing_code=map.billing_code and inn.last_updated_on BETWEEN map.version_open_date AND map.version_close_date
+)
+""";
+
+execute immediate """create temp table if not exists dataset_existence as (select count(*) as table_count from region-US.INFORMATION_SCHEMA.TABLES
+where table_schema='MRF_Hospital_Analytical_"""||client_name||"""')""";
+
+if row.billing_class_value='institutional' and (select table_count from dataset_existence)>0 then
+execute immediate """create or replace temp table provider_ngtd_prc_"""||row.billing_class_value||""" as (
+select distinct mrf_hsptl_dtl_unique_file_id,mrf_payer_name, raw_payer_name, mrf_plan_name, mrf_plan_name_level_2, raw_plan_name, billing_code_type, ngtd.billing_code, billing_code_description,billing_code_category_level1, billing_code_category_level2,negotiated_rate,stndrd_ngtd_charge_prcntg, negotiated_type, inn_month, inn_year, last_updated_on,additional_information,additional_payer_notes,gross_charge
+from (
+select distinct mrf_hsptl_dtl_unique_file_id, coalesce(client_mapped_payer_name, mrf_mapped_payer_name, mrf_payer_name) as mrf_payer_name, mrf_payer_name as raw_payer_name, coalesce(client_mapped_plan_name, mrf_mapped_plan_name, mrf_plan_name) as mrf_plan_name,coalesce(client_mapped_plan_name_level_2, mrf_mapped_plan_name_level_2, mrf_plan_name) as mrf_plan_name_level_2, mrf_plan_name as raw_plan_name, billing_code_type, billing_code, negotiated_rate,stndrd_ngtd_charge_prcntg, negotiated_type,additional_information,additional_payer_notes, gross_charge
+from `MRF_Hospital_Analytical_"""||client_name||""".mrf_hospital_analytical_ngtd_rates`
+--- get the state of the hospital file
+left join (
+select distinct mrf_hsptl_dtl_unique_file_id, state
+from `MRF_Hospital_Analytical_"""||client_name||""".mrf_hospital_analytical`
+)  header
+using (mrf_hsptl_dtl_unique_file_id)
+--- get payer/plan mapping
+left join MRF_Payer_Analytical_"""||client_name||""".mrf_analytical_payer_plan_mapping mapping
+on mrf_payer_name = source_payer_name
+and mrf_plan_name = source_plan_name 
+--- join on state code only for hospital files as payer files can have multiple states and we don't map payer files
+and header.state = mapping.state
+and data_source = 'provider'  /* only bring provider file mappings */
+where not (lower(negotiated_type) = 'percentage' and stndrd_ngtd_charge_prcntg is null)
+and lower(negotiated_type) not like 'mrf adjusted%per diem%'
+) ngtd
+join (
+select distinct mrf_hsptl_dtl_unique_file_id, last_updated_on,
+CASE EXTRACT(MONTH FROM last_updated_on)
+    WHEN 1 THEN 'January'
+    WHEN 2 THEN 'February'
+    WHEN 3 THEN 'March'
+    WHEN 4 THEN 'April'
+    WHEN 5 THEN 'May'
+    WHEN 6 THEN 'June'
+    WHEN 7 THEN 'July'
+    WHEN 8 THEN 'August'
+    WHEN 9 THEN 'September'
+    WHEN 10 THEN 'October'
+    WHEN 11 THEN 'November'
+    WHEN 12 THEN 'December'
+END AS inn_month,
+EXTRACT(YEAR FROM last_updated_on) AS inn_year
+from `MRF_Hospital_Analytical_"""||client_name||""".mrf_hospital_analytical`
+) inn
+using (mrf_hsptl_dtl_unique_file_id)
+left join (
+select distinct billing_code, coalesce(mrf_mapped_billing_code_long_desc, billing_code_long_desc) as billing_code_description, coalesce(mrf_mapped_billing_code_category_level1, billing_code_category_level1) as billing_code_category_level1, coalesce(mrf_mapped_billing_code_category_level2, billing_code_category_level2) as billing_code_category_level2,version_open_date,version_close_date
+from `MRF_Payer_Reference.mrf_rfrnc_billing_code_dtls` 
+) map
+on ngtd.billing_code=map.billing_code and inn.last_updated_on BETWEEN map.version_open_date AND map.version_close_date
+)
+""";
+end if;
+
+if row.billing_class_value='institutional' and ((select table_count from dataset_existence)>0) then
+execute immediate """create or replace temp table joined_base_data_"""||row.billing_class_value||""" 
+cluster by negotiated_type, billing_code_type
+as (
+--- Get hospital details
+with providers as (
+  select distinct bus_nm as npi_name, corporate_parent_name as system_name, zip5_code, state_code, CITY_NAME,geo_address_latitude_number,geo_address_logitude_number, cbsa_title as msa_cbsa_description, COT_FCLT_TYP_DESC, COT_SPCL_DESC, licensed_bed_count_range, fips_cnty_desc, cot_clas_desc, inn_negotiated_rate_id, cbsa_code AS msa_code, org_ccn_id,
+  --- set the rank based on the tin_npi_priority parameter
+--- if the parameter is 'tin' then set rank1 for extraction type tin  and rank 2 for npi
+--- if the parameter is 'npi' then set rank1 for extraction type npi and rank 2 for tin
+--- if the parameter is 'both' then set rank1 for both extraction types 
+  case '""" || tin_npi_priority || """'
+  when 'tin' then case lower(extraction_type) when 'tin' then 1 else 2 end
+  when 'npi' then case lower(extraction_type) when 'npi' then 1 else 2 end
+  else 1 
+  end as extraction_type_rank,
+  from `MRF_Payer_Analytical_"""||client_name||""".mrf_client_provider_intermediate` prvdr
+  where inn_negotiated_rate_id in (select distinct inn_negotiated_rate_id  from ngtd_prc_"""||row.billing_class_value||""")
+  and npi_name_source = case '"""||row.billing_class_value||"""' when "institutional" then "IQVIA Hospital" when "professional" then "IQVIA Physician" end
+),
+--- get service code details
+service_codes as (
+  select distinct service_code as place_of_service_code, code_name as place_of_service_name, inn_ngtd_prc_id ,version_open_date,version_close_date
+  from (
+    select distinct inn_ngtd_prc_id, service_code
+    from `MRF_Payer_Analytical_"""||client_name||""".mrf_analytical_inn_ngtd_prc_srvccd_dtl`
+    where inn_ngtd_prc_id  in (select distinct inn_ngtd_prc_id from ngtd_prc_"""||row.billing_class_value||""")
+  )
+  left join (
+    select distinct  code as service_code, code_name ,version_open_date,version_close_date
+    from `MRF_Payer_Reference.mrf_rfrnc_service_code_dtls` 
+  )
+  using (service_code)
+),
+-- get the npi_data based on bus_nm from hospital_name_mapping table and last_updated_on between version_open_date and version_close_date
+
+filtered_npi_dtls AS (
+  SELECT DISTINCT
+    mrf_hsptl_dtl_unique_file_id,
+    npi_dtls.bus_nm,
+    corp_par_nm,
+    zip5_cd,
+    st_cd,
+    city_nm,
+    geo_addr_lat_nbr,
+    geo_addr_lon_nbr,
+    cbsa_name,
+    cot_fclt_typ_desc,
+    cot_spcl_desc,
+    tot_lic_bed_cnt,
+    fips_cnty_desc,
+    cot_clas_desc,
+    cbsa_code,
+    org_ccn_id,
+    org_tax_id,
+    version_open_date,
+    version_close_date,
+    last_updated_on,
+-- Calculate the number of not null columns
+CONCAT(addr_ln_1_txt, ',', city_nm, ',', st_cd, ',', zip5_cd) AS address,
+  FROM MRF_Payer_Reference.mrf_rfrnc_npi_dtls npi_dtls
+  join (SELECT DISTINCT mrf_hsptl_dtl_unique_file_id, bus_nm, last_updated_on FROM  MRF_Hospital_Analytical_"""||client_name||""".mrf_hospital_analytical  
+
+        join MRF_Payer_Reference.mrf_hospital_name_mapping 
+        on reporting_entity_name=mrf_hospital_name
+        and hospital_address = source_file_address
+        ) mapping
+        on npi_dtls.bus_nm=mapping.bus_nm 
+        where mapping.last_updated_on between version_open_date and version_close_date
+),
+
+-- filter the records based on address to get exact npi details of required bus_nm
+
+neg_providers as (
+  select distinct 
+  a.mrf_hsptl_dtl_unique_file_id,
+  a.bus_nm as npi_name,
+  corp_par_nm AS system_name,
+  zip5_cd AS zip5_code,
+  st_cd AS state_code,
+  INITCAP(city_nm) AS city_name,
+  geo_addr_lat_nbr AS geo_address_latitude_number,
+  geo_addr_lon_nbr AS geo_address_logitude_number,
+  cbsa_name as  msa_cbsa_description,
+  cot_fclt_typ_desc,
+  cot_spcl_desc,
+      CASE 
+      WHEN COALESCE(tot_lic_bed_cnt) >= 350 THEN "350+"
+      WHEN COALESCE(tot_lic_bed_cnt) >= 300 THEN "300-349"
+      WHEN COALESCE(tot_lic_bed_cnt) >= 250 THEN "250-299"
+      WHEN COALESCE(tot_lic_bed_cnt) >= 200 THEN "200-249"
+      WHEN COALESCE(tot_lic_bed_cnt) >= 150 THEN "150-199"
+      WHEN COALESCE(tot_lic_bed_cnt) >= 100 THEN "100-149"
+      WHEN COALESCE(tot_lic_bed_cnt) >= 50 THEN "050-099"
+      WHEN COALESCE(tot_lic_bed_cnt) >= 0 THEN "000-049"
+    END AS Licensed_Bed_Count_Range,
+  fips_cnty_desc,
+  cot_clas_desc,
+  cbsa_code as msa_code,
+  org_ccn_id
+  from filtered_npi_dtls a
+  inner JOIN MRF_Payer_Reference.mrf_hospital_name_mapping mapping
+  on a.bus_nm=mapping.bus_nm
+  and lower(a.address) = lower(mapping.npi_rfrnc_address)
+
+          
+  union all
+
+  select distinct
+  a.mrf_hsptl_dtl_unique_file_id,
+  a.bus_nm as npi_name,
+  corp_par_nm AS system_name,
+  zip5_cd AS zip5_code,
+  st_cd AS state_code,
+  INITCAP(city_nm) AS city_name,
+  geo_addr_lat_nbr AS geo_address_latitude_number,
+  geo_addr_lon_nbr AS geo_address_logitude_number,
+  cbsa_name as  msa_cbsa_description,
+  cot_fclt_typ_desc,
+  cot_spcl_desc,
+      CASE
+      WHEN COALESCE(tot_lic_bed_cnt) >= 350 THEN "350+"
+      WHEN COALESCE(tot_lic_bed_cnt) >= 300 THEN "300-349"
+      WHEN COALESCE(tot_lic_bed_cnt) >= 250 THEN "250-299"
+      WHEN COALESCE(tot_lic_bed_cnt) >= 200 THEN "200-249"
+      WHEN COALESCE(tot_lic_bed_cnt) >= 150 THEN "150-199"
+      WHEN COALESCE(tot_lic_bed_cnt) >= 100 THEN "100-149"
+      WHEN COALESCE(tot_lic_bed_cnt) >= 50 THEN "050-099"
+      WHEN COALESCE(tot_lic_bed_cnt) >= 0 THEN "000-049"
+    END AS Licensed_Bed_Count_Range,
+  fips_cnty_desc,
+  cot_clas_desc,
+  cbsa_code as msa_code,
+  org_ccn_id
+  from filtered_npi_dtls a
+  where a.org_tax_id in (select CAST(REGEXP_REPLACE(ein, r'[^0-9]', '') AS INT64) as ein from MRF_Hospital_Analytical_"""||client_name||""".mrf_hospital_analytical)
+)
+--- join all CTEs to get the final base data
+select distinct 
+  inn_payer_file_group_id, mrf_payer_name, raw_payer_name, mrf_plan_name as Plan_Name, mrf_plan_name_level_2 as Plan_Name_level_2, raw_plan_name, inn_month, inn_year, last_updated_on,
+  billing_code_type, billing_code, billing_code_description, billing_code_category_level1, billing_code_category_level2, 
+  negotiation_arrangement,place_of_service_code, place_of_service_name, 
+  npi_name, system_name, zip5_code as zip_code, state_code, city_name, geo_address_latitude_number,geo_address_logitude_number, msa_cbsa_description, fips_cnty_desc, cot_clas_desc, cot_fclt_typ_desc, cot_spcl_desc, Licensed_Bed_Count_Range, 0.0 as Medicare_Rate, '"""||client_name||"""' as client_name, msa_code, org_ccn_id, 'payer' as source_id,
+  negotiated_type, additional_information,additional_payer_notes, 
+  --- average the rates to reduce the number of rows in output
+--- Keep all original percentage rates in a single array so that they can be unnested and used for normalization later
+  case lower(negotiated_type)
+    when "percentage" then array_agg(negotiated_rate)
+    else null
+  end as rate_array, 
+  avg(negotiated_rate) as negotiated_rate, min(negotiated_rate) as min_negotiated_rate, max(negotiated_rate) as max_negotiated_rate,
+  -- Added new column Neg_Rate_Distinct_Cnt to calculate distinct count of rates
+  count(distinct negotiated_rate) as Neg_Rate_Distinct_Cnt,
+  --- Added new column in provider data to get the gross charges so making it null for payer
+  NULL as gross_charge
+from providers t2
+left join (
+  service_codes t3
+  right join ngtd_prc_"""||row.billing_class_value||""" t1
+  on t1.inn_ngtd_prc_id=t3.inn_ngtd_prc_id and t1.last_updated_on between t3.version_open_date AND t3.version_close_date
+)
+using (inn_negotiated_rate_id)
+group by inn_payer_file_group_id, mrf_payer_name, raw_payer_name, Plan_Name, Plan_Name_level_2, raw_plan_name, inn_month, inn_year, last_updated_on,
+  billing_code_type, billing_code, billing_code_description, billing_code_category_level1, billing_code_category_level2, 
+  negotiated_type, negotiation_arrangement,additional_information,additional_payer_notes, place_of_service_code, place_of_service_name, 
+  npi_name, system_name, zip_code, state_code, city_name, geo_address_latitude_number, geo_address_logitude_number, msa_cbsa_description, fips_cnty_desc, cot_clas_desc, cot_fclt_typ_desc, cot_spcl_desc, Licensed_Bed_Count_Range, Medicare_Rate, client_name, msa_code, org_ccn_id, extraction_type_rank, load_dtm
+--- rank the records based on extraction type rank,   and only keep the top rank record
+qualify dense_rank() over (partition by npi_name, mrf_payer_name, plan_name, plan_name_level_2, billing_code_type, billing_code, negotiated_type order by extraction_type_rank, last_updated_on desc, load_dtm desc) = 1
+union all
+
+select mrf_hsptl_dtl_unique_file_id, mrf_payer_name, raw_payer_name,mrf_plan_name as Plan_Name, mrf_plan_name_level_2 as Plan_Name_level_2, raw_plan_name,inn_month, inn_year, last_updated_on,
+billing_code_type, billing_code, billing_code_description, billing_code_category_level1, billing_code_category_level2,'ffs' as negotiation_arrangement,null as place_of_service_code,null as place_of_service_name,npi_name, system_name, zip5_code as zip_code, state_code, city_name, geo_address_latitude_number, geo_address_logitude_number, msa_cbsa_description, fips_cnty_desc, cot_clas_desc, cot_fclt_typ_desc, cot_spcl_desc, Licensed_Bed_Count_Range, 0.0 as Medicare_Rate, '"""||client_name||"""' as client_name, msa_code, org_ccn_id,'provider' as source_id,
+negotiated_type,additional_information,additional_payer_notes,
+--- average the rates to reduce the number of rows in output
+--- Keep all original percentage rates in a single array so that they can be unnested and used for normalization later
+case 
+when lower(negotiated_type) like "%percentage%" and avg(negotiated_rate) is null then array_agg(stndrd_ngtd_charge_prcntg)
+else null
+end as rate_array,
+case when lower(negotiated_type) like "%percentage%" and avg(negotiated_rate) is null then avg(stndrd_ngtd_charge_prcntg)
+else avg(negotiated_rate) end as negotiated_rate,
+case when lower(negotiated_type) like "%percentage%" and avg(negotiated_rate) is null then min(stndrd_ngtd_charge_prcntg)
+else min(negotiated_rate) end as min_negotiated_rate,
+case when lower(negotiated_type) like "%percentage%" and avg(negotiated_rate) is null then max(stndrd_ngtd_charge_prcntg)
+else max(negotiated_rate) end as max_negotiated_rate,
+-- Added new column Neg_Rate_Distinct_Cnt to calculate distinct count of rates
+case when lower(negotiated_type) like "%percentage%" and avg(negotiated_rate) is null then count(distinct stndrd_ngtd_charge_prcntg)
+else count(distinct negotiated_rate) end as Neg_Rate_Distinct_Cnt,
+--- Added new column in provider data to get the gross charges for gross charge table.
+avg(gross_charge) as gross_charge,
+from neg_providers t4
+join provider_ngtd_prc_"""||row.billing_class_value||""" t5
+using (mrf_hsptl_dtl_unique_file_id)
+group by mrf_hsptl_dtl_unique_file_id, mrf_payer_name, raw_payer_name, Plan_Name, Plan_Name_level_2,raw_plan_name, inn_month, inn_year, last_updated_on,
+billing_code_type, billing_code, billing_code_description, billing_code_category_level1, billing_code_category_level2, 
+negotiated_type,negotiation_arrangement, additional_information,additional_payer_notes, npi_name, system_name, zip_code, state_code, city_name, geo_address_latitude_number, geo_address_logitude_number, msa_cbsa_description, fips_cnty_desc, cot_clas_desc, cot_fclt_typ_desc, cot_spcl_desc, Licensed_Bed_Count_Range, Medicare_Rate, client_name, msa_code, org_ccn_id)""";
+else 
+--exclude the hospital analytical for professional or if the hospital analytical layer doesn't exist
+execute immediate """create or replace temp table joined_base_data_"""||row.billing_class_value||""" 
+cluster by negotiated_type, billing_code_type
+as (
+--- Get hospital details
+with providers as (
+select distinct bus_nm as npi_name, corporate_parent_name as system_name, zip5_code, state_code, CITY_NAME,geo_address_latitude_number,geo_address_logitude_number, cbsa_title as msa_cbsa_description, COT_FCLT_TYP_DESC, COT_SPCL_DESC, licensed_bed_count_range, fips_cnty_desc, cot_clas_desc, inn_negotiated_rate_id, cbsa_code AS msa_code, org_ccn_id,
+--- set the rank based on the tin_npi_priority parameter
+--- if the parameter is 'tin' then set rank1 for extraction type tin  and rank 2 for npi
+--- if the parameter is 'npi' then set rank1 for extraction type npi and rank 2 for tin
+--- if the parameter is 'both' then set rank1 for both extraction types 
+case '""" || tin_npi_priority || """'
+when 'tin' then case lower(extraction_type) when 'tin' then 1 else 2 end
+when 'npi' then case lower(extraction_type) when 'npi' then 1 else 2 end
+else 1 
+end as extraction_type_rank,
+from `MRF_Payer_Analytical_"""||client_name||""".mrf_client_provider_intermediate` prvdr
+where inn_negotiated_rate_id in (select distinct inn_negotiated_rate_id  from ngtd_prc_"""||row.billing_class_value||""")
+and npi_name_source = case '"""||row.billing_class_value||"""' 
+when "institutional" then "IQVIA Hospital"
+when "professional" then "IQVIA Physician"
+end
+),
+--- get service code details
+service_codes as (
+select distinct service_code as place_of_service_code, code_name as place_of_service_name, inn_ngtd_prc_id ,version_open_date,version_close_date
+from (
+select distinct inn_ngtd_prc_id, service_code
+from `MRF_Payer_Analytical_"""||client_name||""".mrf_analytical_inn_ngtd_prc_srvccd_dtl`
+where inn_ngtd_prc_id  in (select distinct inn_ngtd_prc_id from ngtd_prc_"""||row.billing_class_value||""")
+)
+left join (
+select distinct  code as service_code, code_name ,version_open_date,version_close_date
+from `MRF_Payer_Reference.mrf_rfrnc_service_code_dtls` 
+)
+using (service_code)
+)
+--- join all CTEs to get the final base data
+--- join all CTEs to get the final base data
+select distinct inn_payer_file_group_id, mrf_payer_name, raw_payer_name, mrf_plan_name as Plan_Name, mrf_plan_name_level_2 as Plan_Name_level_2,raw_plan_name, inn_month, inn_year, last_updated_on,
+billing_code_type, billing_code, billing_code_description, billing_code_category_level1, billing_code_category_level2, 
+negotiation_arrangement,place_of_service_code, place_of_service_name, 
+npi_name, system_name, zip5_code as zip_code, state_code, city_name, geo_address_latitude_number, geo_address_logitude_number, msa_cbsa_description, fips_cnty_desc, cot_clas_desc, cot_fclt_typ_desc, cot_spcl_desc, Licensed_Bed_Count_Range, 0.0 as Medicare_Rate, '"""||client_name||"""' as client_name, msa_code, org_ccn_id, 'payer' as source_id,
+negotiated_type, additional_information,additional_payer_notes,
+--- average the rates to reduce the number of rows in output
+--- Keep all original percentage rates in a single array so that they can be unnested and used for normalization later
+case lower(negotiated_type)
+when "percentage" then array_agg(negotiated_rate)
+else null
+end as rate_array, 
+avg(negotiated_rate) as negotiated_rate, min(negotiated_rate) as min_negotiated_rate, max(negotiated_rate) as max_negotiated_rate,
+-- Added new column Neg_Rate_Distinct_Cnt to calculate distinct count of rates
+count(distinct negotiated_rate) as Neg_Rate_Distinct_Cnt,
+NULL as gross_charge
+from providers t2
+left join (
+service_codes t3
+right join ngtd_prc_"""||row.billing_class_value||""" t1
+on t1.inn_ngtd_prc_id=t3.inn_ngtd_prc_id and t1.last_updated_on between t3.version_open_date AND t3.version_close_date
+)
+using (inn_negotiated_rate_id)
+group by inn_payer_file_group_id, mrf_payer_name,raw_payer_name, Plan_Name, Plan_Name_level_2, raw_plan_name,inn_month, inn_year, last_updated_on,
+billing_code_type, billing_code, billing_code_description, billing_code_category_level1, billing_code_category_level2, 
+negotiated_type,negotiation_arrangement, additional_information,additional_payer_notes, place_of_service_code, place_of_service_name, 
+npi_name, system_name, zip_code, state_code, city_name, geo_address_latitude_number, geo_address_logitude_number, msa_cbsa_description, fips_cnty_desc, cot_clas_desc, cot_fclt_typ_desc, cot_spcl_desc, Licensed_Bed_Count_Range, Medicare_Rate, client_name, msa_code, org_ccn_id,
+extraction_type_rank,
+load_dtm
+--- rank the records based on extraction type rank,   and only keep the top rank record
+qualify dense_rank() over (partition by npi_name, mrf_payer_name, plan_name, plan_name_level_2, billing_code_type, billing_code, negotiated_type 
+  order by extraction_type_rank, last_updated_on desc, load_dtm desc) = 1 
+)
+""";
+end if;
+
+-- Create final gross charge details table in MRF_Payer_Analytical dataset using CTEs - separate for each billing class
+execute immediate """create or replace table `MRF_Payer_Analytical_"""||client_name||""".gross_charge_details_"""||row.billing_class_value||"""`
+cluster by npi_name, billing_code_type, billing_code
+as (
+-- Hospital gross charges CTE for all billing code types
+with hospital_gross_charges_all as (
+  select distinct 
+    npi_name,
+    mrf_payer_name,
+    plan_name,
+    billing_code_type,
+    case
+      when billing_code_type in ('CPT','HCPCS','CPT/HCPCS') then lpad(trim(billing_code), 5, '0')
+      when billing_code_type in ('MS-DRG') then lpad(trim(billing_code), 3, '0')
+      when billing_code_type in ('RC') then lpad(trim(billing_code), 4, '0')
+      else trim(billing_code) 
+    end as billing_code,
+    avg(gross_charge) as hsptl_gross_charge
+  from joined_base_data_"""||row.billing_class_value||""" 
+  where billing_code_type in ('CPT','HCPCS','CDM','MS-DRG', 'RC','CPT/HCPCS')
+    and gross_charge is not null
+    and source_id='provider'
+    and npi_name is not null
+  group by 1,2,3,4,5
+),
+-- Client utilization gross charges CTE for all billing code types
+client_gross_charges_all as (
+  select distinct 
+    npi_name,
+    client_plan as plan_name,
+    client_billing_code_type as billing_code_type,
+    case
+      when client_billing_code_type in ('CPT','HCPCS','CPT/HCPCS') then lpad(trim(client_billing_code), 5, '0')
+      when client_billing_code_type in ('MS-DRG') then lpad(trim(client_billing_code), 3, '0')
+      when client_billing_code_type in ('RC') then lpad(trim(client_billing_code), 4, '0')
+      else trim(client_billing_code) 
+    end as billing_code,
+    ---sum(total_charges)/sum(cases) as client_gross_charge
+    sum(client_expected_payment)/sum(client_healthsystem_volume) as client_gross_charge
+  from `MRF_Payer_Analytical_"""||client_name||""".mrf_client_utilization`
+  where client_billing_code_type in ('CPT','HCPCS','CDM','MS-DRG', 'RC','CPT/HCPCS')
+    and client_billing_code is not null
+    ---and total_charges is not null
+    and client_expected_payment is not null
+    and client_billing_class = '"""||row.billing_class_value||"""'
+  group by 1,2,3,4
+),
+-- CMS/LDS gross charges CTE for all billing code types
+lds_gross_charges_all as (
+  select distinct
+    trim(bus_nm) as npi_name,
+    'Medicare' as plan_name,
+    case 
+      when billing_code_type = 'DRG' then 'MS-DRG'
+      else billing_code_type
+    end as billing_code_type,
+    case
+      when billing_code_type = 'DRG' then lpad(trim(billing_code), 3, '0')
+      when billing_code_type in ('CPT','HCPCS','CPT/HCPCS') then lpad(trim(billing_code), 5, '0')
+      when billing_code_type in ('RC') then lpad(trim(billing_code), 4, '0')
+      else trim(billing_code) 
+    end as billing_code,
+    avg(charge_per_admit) as lds_gross_charge
+  from `MRF_Payer_Reference.mrf_rfrnc_medicare_rate_dtls`
+  where billing_code_type in ('CPT','HCPCS','DRG', 'RC','CPT/HCPCS')
+    and charge_per_admit is not null
+    and billing_code is not null
+  group by 1,2,3,4
+),
+-- Master combinations CTE for all billing code types
+master_combinations_all as (
+  select distinct npi_name, plan_name, billing_code_type, billing_code
+  from (
+    select npi_name, plan_name, billing_code_type, billing_code 
+    from hospital_gross_charges_all
+    where billing_code_type in ('CPT','HCPCS','CDM','MS-DRG', 'RC','CPT/HCPCS')
+    union distinct
+    
+    select npi_name, plan_name, billing_code_type, billing_code 
+    from client_gross_charges_all
+    where billing_code_type in ('CPT','HCPCS','CDM','MS-DRG', 'RC','CPT/HCPCS')
+    union distinct
+    
+    select npi_name, plan_name, billing_code_type, billing_code 
+    from lds_gross_charges_all
+    where billing_code_type in ('CPT','HCPCS','MS-DRG', 'RC','CPT/HCPCS')
+  )
+  where billing_code_type in ('CPT','HCPCS','CDM','MS-DRG', 'RC','CPT/HCPCS')
+)
+-- Final result with all gross charge sources combined
+select distinct
+  mc.npi_name,
+  mc.plan_name,
+  mc.billing_code_type,
+  mc.billing_code,
+  hgc.hsptl_gross_charge,
+  lgc.lds_gross_charge,
+  cgc.client_gross_charge,
+  -- Priority-based gross charge selection (Client > Hospital > CMS)
+  case 
+    when cgc.client_gross_charge is not null then cgc.client_gross_charge
+    when hgc.hsptl_gross_charge is not null then hgc.hsptl_gross_charge
+    when lgc.lds_gross_charge is not null then lgc.lds_gross_charge
+    else null
+  end as primary_gross_charge,
+  -- Source indicator
+  case 
+    when cgc.client_gross_charge is not null then 'Client Data'
+    when hgc.hsptl_gross_charge is not null then 'Hospital MRF'
+    when lgc.lds_gross_charge is not null then 'CMS/LDS Data'
+    else 'No Data Available'
+  end as gross_charge_source,
+  -- Variance calculations
+  case 
+    when cgc.client_gross_charge is not null and hgc.hsptl_gross_charge is not null 
+      then round(abs(cgc.client_gross_charge - hgc.hsptl_gross_charge) / hgc.hsptl_gross_charge * 100, 2)
+    else null
+  end as client_vs_hospital_variance_pct,
+  case 
+    when hgc.hsptl_gross_charge is not null and lgc.lds_gross_charge is not null 
+      then round(abs(hgc.hsptl_gross_charge - lgc.lds_gross_charge) / lgc.lds_gross_charge * 100, 2)
+    else null
+  end as hospital_vs_cms_variance_pct,
+  case 
+    when cgc.client_gross_charge is not null and lgc.lds_gross_charge is not null 
+      then round(abs(cgc.client_gross_charge - lgc.lds_gross_charge) / lgc.lds_gross_charge * 100, 2)
+    else null
+  end as client_vs_cms_variance_pct,
+  '"""||row.billing_class_value||"""' as billing_class,
+  current_datetime() as created_timestamp
+from master_combinations_all mc
+left join hospital_gross_charges_all hgc
+  on mc.npi_name = hgc.npi_name
+  and mc.plan_name = hgc.plan_name
+  and mc.billing_code_type = hgc.billing_code_type
+  and mc.billing_code = hgc.billing_code
+left join client_gross_charges_all cgc
+  on mc.npi_name = cgc.npi_name
+  and mc.plan_name = cgc.plan_name
+  and mc.billing_code_type = cgc.billing_code_type
+  and mc.billing_code = cgc.billing_code
+left join lds_gross_charges_all lgc
+  on mc.npi_name = lgc.npi_name
+  and mc.billing_code_type = lgc.billing_code_type
+  and mc.billing_code = lgc.billing_code
+where mc.billing_code_type in ('CPT/HCPCS','CPT','HCPCS','CDM','MS-DRG', 'RC')
+  and (hgc.hsptl_gross_charge is not null 
+       or cgc.client_gross_charge is not null 
+       or lgc.lds_gross_charge is not null)
+)""";
+
+
+--- create temporary tables for the cms and commercial los data
+CREATE OR REPLACE TEMP TABLE cms_avg_length_of_stay AS
+SELECT distinct lpad(ltrim(ms_drg,'0'),3,'0') as drg_code, AVG(CAST(geometric_mean_los AS FLOAT64)) AS avg_los, version_open_date, version_close_date
+FROM `MRF_Payer_Reference.mrf_rfrnc_cms_los_data`
+GROUP BY drg_code, version_open_date, version_close_date;
+
+CREATE OR REPLACE TEMP TABLE commercial_avg_length_of_stay AS
+SELECT distinct lpad(ltrim(  Drg_code,'0'),3,'0') as drg_code, AVG(Gmlos) AS avg_los
+FROM `MRF_Payer_Reference.mrf_rfrnc_komodo_commercial_los_data`
+GROUP BY drg_code;
+
+-- Convert percentage records to dollar amounts using gross charge details
+execute immediate """create or replace temp table percentage_to_dollar_conversion_"""||row.billing_class_value||""" as (
+with percentage_records as (
+  -- Get percentage records that need conversion
+  select *
+  from joined_base_data_"""||row.billing_class_value||"""
+  where lower(negotiated_type) like '%percentage%' 
+    and lower(negotiated_type) not like '%adjusted%'
+    and negotiated_rate is not null
+    and source_id='payer'
+    and negotiated_rate between 1 and 200  -- Filter for reasonable percentage range
+),
+converted_records as (
+  -- Convert percentage to dollar amounts using gross charge data
+  select 
+    pr.* except(negotiated_rate, min_negotiated_rate, max_negotiated_rate, negotiated_type, rate_array),
+    -- Dynamic negotiated_type based on gross_charge_source
+    case 
+      when gcd.gross_charge_source = 'Client Data' then 'MRF Adjusted Percentage (using Client Data)'
+      when gcd.gross_charge_source = 'Hospital MRF' then 'MRF Adjusted Percentage (using Hospital MRF)'
+      when gcd.gross_charge_source = 'CMS/LDS Data' then 'MRF Adjusted Percentage (using CMS/LDS Data)'
+      else 'MRF Adjusted Percentage'
+    end as negotiated_type,
+    -- Convert percentage to dollar amount using primary gross charge
+    case 
+      when gcd.primary_gross_charge is not null and gcd.primary_gross_charge > 0
+      then pr.negotiated_rate * gcd.primary_gross_charge / 100
+      else null
+    end as negotiated_rate,
+    case 
+      when gcd.primary_gross_charge is not null and gcd.primary_gross_charge > 0
+      then pr.min_negotiated_rate * gcd.primary_gross_charge / 100
+      else null
+    end as min_negotiated_rate,
+    case 
+      when gcd.primary_gross_charge is not null and gcd.primary_gross_charge > 0
+      then pr.max_negotiated_rate * gcd.primary_gross_charge / 100
+      else null
+    end as max_negotiated_rate,
+    gcd.gross_charge_source,
+    gcd.primary_gross_charge
+  from percentage_records pr
+  left join `MRF_Payer_Analytical_"""||client_name||""".gross_charge_details_"""||row.billing_class_value||"""` gcd
+    on pr.npi_name = gcd.npi_name
+    and pr.plan_name = gcd.plan_name
+    and pr.billing_code_type = gcd.billing_code_type
+    and pr.billing_code = gcd.billing_code
+  where gcd.primary_gross_charge is not null 
+    and gcd.primary_gross_charge > 0
+    -- Only convert if we have a valid gross charge
+    and gcd.gross_charge_source != 'No Data Available'
+)
+select * except(gross_charge_source, primary_gross_charge)
+from converted_records
+where negotiated_rate is not null
+  and negotiated_rate > 0  -- Ensure we have valid converted rates
+)""";
+
+
+--- adjust the per diem rates using the average length of stay
+execute immediate """create or replace temp table add_adjusted_per_diem_rates_"""||row.billing_class_value||""" as 
+with temp1 as (
+select *except(gross_charge)
+from joined_base_data_"""||row.billing_class_value||"""
+
+union all
+
+select 
+inn_payer_file_group_id,
+mrf_payer_name,
+raw_payer_name,
+Plan_Name,
+Plan_Name_level_2,
+raw_plan_name,
+inn_month,
+inn_year,
+last_updated_on,
+billing_code_type,
+billing_code,
+billing_code_description,
+billing_code_category_level1,
+billing_code_category_level2,
+negotiation_arrangement,
+place_of_service_code,
+place_of_service_name,
+npi_name,
+system_name,
+zip_code,
+state_code,
+city_name,
+geo_address_latitude_number,
+geo_address_logitude_number,
+msa_cbsa_description,
+fips_cnty_desc,
+cot_clas_desc,
+cot_fclt_typ_desc,
+cot_spcl_desc,
+Licensed_Bed_Count_Range,
+Medicare_Rate,
+client_name,
+msa_code,
+org_ccn_id,
+source_id,
+case 
+  when lower(negotiated_type) = 'per diem'
+  then 'MRF Adjusted (Per Diem)'
+  when lower(negotiated_type) like '%per diem%' 
+  then concat('MRF Adjusted',substr(negotiated_type,4))
+  else negotiated_type
+end as negotiated_type,
+additional_information,
+additional_payer_notes,
+rate_array,
+--- use cms los for medicare advantage and medicaid plans
+--- use commercial los for remaining plans as first priority and cms los as second priority if the use_komodo flag is set to true
+--- else use cms los for all plans
+case 
+  when lower(Plan_Name) like 'medi%'
+  then negotiated_rate * cms_los.avg_los
+  when """||use_komodo||""" = true
+  then negotiated_rate * coalesce(comm_los.avg_los, cms_los.avg_los)
+  else negotiated_rate * cms_los.avg_los
+end as negotiated_rate,
+--- calculate the min and max negotiated rate based on similar logic as above
+case 
+  when lower(Plan_Name) like 'medi%'
+  then min_negotiated_rate * cms_los.avg_los
+  when """||use_komodo||""" = true
+  then min_negotiated_rate * coalesce(comm_los.avg_los, cms_los.avg_los)
+  else min_negotiated_rate * cms_los.avg_los
+end as min_negotiated_rate,
+case 
+  when lower(Plan_Name) like 'medi%'
+  then max_negotiated_rate * cms_los.avg_los
+  when """||use_komodo||""" = true
+  then max_negotiated_rate * coalesce(comm_los.avg_los, cms_los.avg_los)
+  else max_negotiated_rate * cms_los.avg_los
+end as max_negotiated_rate,
+Neg_Rate_Distinct_Cnt
+from (
+select *
+from joined_base_data_"""||row.billing_class_value||"""
+where billing_code_type = "MS-DRG"
+and lower(negotiated_type) like '%per diem%'
+)
+left join cms_avg_length_of_stay cms_los
+on billing_code = cms_los.drg_code
+and last_updated_on between cms_los.version_open_date AND cms_los.version_close_date
+left join commercial_avg_length_of_stay comm_los
+on billing_code = comm_los.drg_code
+)
+--- exclude the null rates
+select *
+from temp1
+where negotiated_rate is not null
+""";
+
+
+-- UTIL CODE TYPES (propagate columns)
+if use_komodo = true then 
+--- fill the billing code gaps with Komodo only if the flag is set to true
+execute immediate """create or replace temp table util_code_types_"""||row.billing_class_value||""" as (
+--- map billing codes to the correct code type using the utilization data
+--- and only take record combinations for gap-filling that satisfy the 70% sufficiency requirement
+select data.*, client_billing_code_type 
+from (
+select inn_payer_file_group_id, mrf_payer_name, raw_payer_name, Plan_Name, Plan_Name_level_2, raw_plan_name, billing_code, 
+npi_name, system_name, zip_code, state_code, city_name, geo_address_latitude_number, geo_address_logitude_number, msa_cbsa_description, fips_cnty_desc, cot_clas_desc, cot_fclt_typ_desc, cot_spcl_desc, Licensed_Bed_Count_Range, client_name, msa_code, org_ccn_id,source_id,inn_month, inn_year,last_updated_on
+from percentage_to_dollar_conversion_"""||row.billing_class_value||"""
+union distinct
+select inn_payer_file_group_id, mrf_payer_name, raw_payer_name, Plan_Name, Plan_Name_level_2, raw_plan_name, billing_code, 
+npi_name, system_name, zip_code, state_code, city_name, geo_address_latitude_number, geo_address_logitude_number, msa_cbsa_description, fips_cnty_desc, cot_clas_desc, cot_fclt_typ_desc, cot_spcl_desc, Licensed_Bed_Count_Range, client_name, msa_code, org_ccn_id,source_id,inn_month, inn_year,last_updated_on
+from add_adjusted_per_diem_rates_"""||row.billing_class_value||"""
+) data
+--- get the correct billing code type and count of codes for each code type, payer and plan combination from utilization data
+join (
+select distinct client_payer, client_plan, client_billing_code_type, client_billing_code, count(distinct client_billing_code) over(partition by client_payer, client_plan, client_billing_code_type) as total_code_count
+from `MRF_Payer_Analytical_"""||client_name||""".mrf_client_utilization`
+where client_billing_class = '"""||row.billing_class_value||"""'
+) utl
+on data.billing_code = utl.client_billing_code
+and mrf_payer_name = client_payer
+and Plan_Name = client_plan
+--- only keep records that satisfy the 70% sufficiency for codes
+--- only codes present in the utilization will be considered
+--- and they will be counted against the code type tagged to them in the utilization data
+qualify count(distinct client_billing_code) over(partition by mrf_payer_name, plan_name, npi_name, client_billing_code_type)/total_code_count >= 0.7
+)
+""";
+
+--- fill the rate gaps with komodo
+execute immediate """create or replace temp table fill_gaps_"""||row.billing_class_value||""" as 
+(
+--- for the missing billing codes, fill the rate with cbsa average/min/max or state average/min/max if cbsa level rate is not available
+select distinct inn_payer_file_group_id, mrf_payer_name, raw_payer_name, Plan_Name, Plan_Name_level_2, raw_plan_name, inn_month, inn_year, last_updated_on,
+billing_code_type, gaps.billing_code, billing_code_description, billing_code_category_level1, billing_code_category_level2, 
+"MRF Derived" as negotiation_arrangement, cast(null as string) as place_of_service_code, cast(null as string) as place_of_service_name, 
+npi_name, system_name, zip_code, gaps.state_code, city_name, geo_address_latitude_number, geo_address_logitude_number, msa_cbsa_description, fips_cnty_desc, cot_clas_desc, cot_fclt_typ_desc, cot_spcl_desc, Licensed_Bed_Count_Range, 
+0.0 as Medicare_Rate, client_name, gaps.msa_code, org_ccn_id,source_id, 
+coalesce(komodo_cbsa.negotiated_type, komodo_state.negotiated_type) as negotiated_type, cast(null as string) as additional_information,cast(null as string) as additional_payer_notes, coalesce(komodo_cbsa.average_rate, komodo_state.average_rate) as negotiated_rate,coalesce(komodo_cbsa.min_rate, komodo_state.min_rate) as min_negotiated_rate, coalesce(komodo_cbsa.max_rate, komodo_state.max_rate) as max_negotiated_rate,
+coalesce(komodo_cbsa.Neg_Rate_Distinct_Cnt,komodo_state.Neg_Rate_Distinct_Cnt) as Neg_Rate_Distinct_Cnt
+from (
+select inn_payer_file_group_id, mrf_payer_name, raw_payer_name, Plan_Name, Plan_Name_level_2, raw_plan_name, inn_month, inn_year,last_updated_on, data.client_billing_code_type as billing_code_type, client_billing_code as billing_code, 
+npi_name, system_name, zip_code, state_code, city_name, geo_address_latitude_number, geo_address_logitude_number, msa_cbsa_description, fips_cnty_desc, cot_clas_desc, cot_fclt_typ_desc, cot_spcl_desc, Licensed_Bed_Count_Range, client_name, msa_code, org_ccn_id,source_id
+from util_code_types_"""||row.billing_class_value||""" data
+--- get all codes for each code type, payer and plan combination from the utilization
+left join (
+select distinct client_payer, client_plan, client_billing_code_type, client_billing_code
+from `MRF_Payer_Analytical_"""||client_name||""".mrf_client_utilization`
+where client_billing_class = '"""||row.billing_class_value||"""'
+) utl
+on data.client_billing_code_type = utl.client_billing_code_type
+and data.mrf_payer_name = utl.client_payer
+and data.Plan_Name = utl.client_plan
+
+except distinct 
+
+--- remove codes that are already present in the files
+--- this will leave us with the records for missing billing codes
+select inn_payer_file_group_id, mrf_payer_name, raw_payer_name, Plan_Name, Plan_Name_level_2, raw_plan_name, inn_month, inn_year, last_updated_on,client_billing_code_type, billing_code, 
+npi_name, system_name, zip_code, state_code, city_name, geo_address_latitude_number, geo_address_logitude_number, msa_cbsa_description, fips_cnty_desc, cot_clas_desc, cot_fclt_typ_desc, cot_spcl_desc, Licensed_Bed_Count_Range, client_name, msa_code, org_ccn_id,source_id
+from util_code_types_"""||row.billing_class_value||""" data
+) gaps
+--- get the billing code reference data for the new records
+left join (
+select distinct billing_code, billing_code_long_desc as billing_code_description, billing_code_category_level1, billing_code_category_level2,version_open_date,version_close_date
+from `MRF_Payer_Reference.mrf_rfrnc_billing_code_dtls` 
+where billing_code_type in (select distinct billing_code_type from ngtd_prc_"""||row.billing_class_value||""") /* only take the code types passed in as arguments to avoid incorrect matching   for codes that are part of multiple code types in reference data */
+) map
+on gaps.billing_code=map.billing_code and gaps.last_updated_on between map.version_open_date and map.version_close_date
+
+--- get the cbsa level average rate, minimum rate and maximum rate
+--- and set the negotiated_type for these records
+left join (select billing_code, cbsa as msa_code, avg(allowed_per_admit) as average_rate, min(allowed_per_admit) as min_rate, max(allowed_per_admit) as max_rate, "MRF Derived (CBSA Level)" as negotiated_type,
+count(distinct allowed_per_admit) as Neg_Rate_Distinct_cnt,version_open_date,version_close_date
+from `MRF_Payer_Reference.mrf_rfrnc_komodo_data` 
+group by billing_code,msa_code,version_open_date,version_close_date
+) komodo_cbsa
+on gaps.billing_code=komodo_cbsa.billing_code and gaps.msa_code=komodo_cbsa.msa_code and gaps.last_updated_on between komodo_cbsa.version_open_date and komodo_cbsa.version_close_date
+
+
+--- get the state level average rate, minimum rate and maximum rate
+--- and set the negotiated_type for these records
+left join (select billing_code, state_code, avg(allowed_per_admit) as average_rate, min(allowed_per_admit) as min_rate, max(allowed_per_admit) as max_rate, "MRF Derived (State Level)" as negotiated_type,
+count(distinct allowed_per_admit) as Neg_Rate_Distinct_cnt,version_open_date,version_close_date
+from `MRF_Payer_Reference.mrf_rfrnc_komodo_data` 
+group by billing_code,state_code,version_open_date,version_close_date
+) komodo_state
+on gaps.billing_code=komodo_state.billing_code and gaps.state_code=komodo_state.state_code and gaps.last_updated_on between komodo_state.version_open_date and komodo_state.version_close_date
+
+)
+""";
+end if;
+
+--- calculate the medicare allowed amount averages at bus_nm, cbsa, state and national level
+--- create the temp table only once and use the same for both institutional and professional
+create temp table if not exists medicare_averages as (
+select distinct billing_code, bus_nm as npi_name, msa_cbsa_cd as msa_code, state_code,vrsn_open_date, vrsn_close_date,
+avg(Medicare_Allowed_amount) over(partition by billing_code, bus_nm, vrsn_open_date, vrsn_close_date) as bus_nm_avg,
+avg(Medicare_Allowed_amount) over(partition by billing_code, msa_cbsa_cd, vrsn_open_date, vrsn_close_date) as cbsa_avg,
+avg(Medicare_Allowed_amount) over(partition by billing_code, state_code, vrsn_open_date, vrsn_close_date) as state_avg,
+avg(Medicare_Allowed_amount) over(partition by billing_code, vrsn_open_date, vrsn_close_date) as national_avg,
+from `MRF_Payer_Reference.mrf_rfrnc_medicare_rate_dtls`
+where Medicare_Allowed_amount is not null
+);
+
+if use_komodo = true then
+--- bring in the records used to fill rate gaps only when the flag is true
+execute immediate """create or replace temp table combined_data_"""||row.billing_class_value||""" 
+cluster by billing_code_type /* cluster to reduce the data being scanned in the next step when filtering on billing code type */
+as (
+--- bring the original records + normalized percentage rates + Komodo gap filling records together
+select 
+  inn_payer_file_group_id,
+  mrf_payer_name,
+  raw_payer_name,
+  Plan_Name,
+  Plan_Name_level_2,
+  raw_plan_name,
+  inn_month,
+  inn_year,
+  last_updated_on,
+  billing_code_type,
+  billing_code,
+  billing_code_description,
+  billing_code_category_level1,
+  billing_code_category_level2,
+  negotiation_arrangement,
+  place_of_service_code,
+  place_of_service_name,
+  npi_name,
+  system_name,
+  zip_code,
+  state_code,
+  city_name,
+  geo_address_latitude_number,
+  geo_address_logitude_number,
+  msa_cbsa_description,
+  fips_cnty_desc,
+  cot_clas_desc,
+  cot_fclt_typ_desc,
+  cot_spcl_desc,
+  Licensed_Bed_Count_Range,
+  Medicare_Rate,
+  client_name,
+  msa_code,
+  org_ccn_id,
+  source_id,
+  negotiated_type,
+  additional_information,
+  additional_payer_notes,
+  negotiated_rate,
+  min_negotiated_rate,
+  max_negotiated_rate,
+  CASE 
+    when lower(negotiated_type) like '%percentage%' and lower(negotiated_type) not like '%adjusted%' then null
+    when lower(negotiated_type) like '%per diem%' and lower(negotiated_type) not like '%mrf adjusted%' then null
+    WHEN Neg_Rate_Distinct_Cnt = 1 THEN "High"
+    WHEN Neg_Rate_Distinct_Cnt > 1 AND Neg_Rate_Distinct_Cnt <= 4 then "Medium"
+    WHEN Neg_Rate_Distinct_Cnt > 4 THEN "Low"
+    ELSE "NA"
+  END AS uniqueness_confidence
+from add_adjusted_per_diem_rates_"""||row.billing_class_value||"""
+
+union all
+
+select
+  inn_payer_file_group_id,
+  mrf_payer_name,
+  raw_payer_name,
+  Plan_Name,
+  Plan_Name_level_2,
+  raw_plan_name,
+  inn_month,
+  inn_year,
+  last_updated_on,
+  billing_code_type,
+  billing_code,
+  billing_code_description,
+  billing_code_category_level1,
+  billing_code_category_level2,
+  negotiation_arrangement,
+  place_of_service_code,
+  place_of_service_name,
+  npi_name,
+  system_name,
+  zip_code,
+  state_code,
+  city_name,
+  geo_address_latitude_number,
+  geo_address_logitude_number,
+  msa_cbsa_description,
+  fips_cnty_desc,
+  cot_clas_desc,
+  cot_fclt_typ_desc,
+  cot_spcl_desc,
+  Licensed_Bed_Count_Range,
+  Medicare_Rate,
+  client_name,
+  msa_code,
+  org_ccn_id,
+  source_id,
+  negotiated_type,
+  additional_information,
+  additional_payer_notes,
+  negotiated_rate,
+  min_negotiated_rate,
+  max_negotiated_rate,
+  CASE 
+    when lower(negotiated_type) like '%percentage%' and lower(negotiated_type) not like '%adjusted%' then null
+    when lower(negotiated_type) like '%per diem%' and lower(negotiated_type) not like '%mrf adjusted%' then null
+    WHEN Neg_Rate_Distinct_Cnt = 1 THEN "High"
+    WHEN Neg_Rate_Distinct_Cnt > 1 AND Neg_Rate_Distinct_Cnt <= 4 then "Medium"
+    WHEN Neg_Rate_Distinct_Cnt > 4 THEN "Low"
+    ELSE "NA"
+  END AS uniqueness_confidence
+from percentage_to_dollar_conversion_"""||row.billing_class_value||"""
+
+union all
+
+select
+  inn_payer_file_group_id,
+  mrf_payer_name,
+  raw_payer_name,
+  Plan_Name,
+  Plan_Name_level_2,
+  raw_plan_name,
+  inn_month,
+  inn_year,
+  last_updated_on,
+  billing_code_type,
+  billing_code,
+  billing_code_description,
+  billing_code_category_level1,
+  billing_code_category_level2,
+  negotiation_arrangement,
+  place_of_service_code,
+  place_of_service_name,
+  npi_name,
+  system_name,
+  zip_code,
+  state_code,
+  city_name,
+  geo_address_latitude_number,
+  geo_address_logitude_number,
+  msa_cbsa_description,
+  fips_cnty_desc,
+  cot_clas_desc,
+  cot_fclt_typ_desc,
+  cot_spcl_desc,
+  Licensed_Bed_Count_Range,
+  Medicare_Rate,
+  client_name,
+  msa_code,
+  org_ccn_id,
+  source_id,
+  negotiated_type,
+  additional_information,
+  additional_payer_notes,
+  negotiated_rate,
+  min_negotiated_rate,
+  max_negotiated_rate,
+  CASE 
+    when lower(negotiated_type) like '%percentage%' and lower(negotiated_type) not like '%adjusted%' then null
+    when lower(negotiated_type) like '%per diem%' and lower(negotiated_type) not like '%mrf adjusted%' then null
+    WHEN Neg_Rate_Distinct_Cnt = 1 THEN "High"
+    WHEN Neg_Rate_Distinct_Cnt > 1 AND Neg_Rate_Distinct_Cnt <= 4 then "Medium"
+    WHEN Neg_Rate_Distinct_Cnt > 4 THEN "Low"
+    ELSE "NA"
+  END AS uniqueness_confidence
+from fill_gaps_"""||row.billing_class_value||"""
+) 
+""";
+else 
+--- exclude the records that are used to fill rate gaps with Komodo
+execute immediate """create or replace temp table combined_data_"""||row.billing_class_value||""" 
+cluster by billing_code_type /* cluster to reduce the data being scanned in the next step when filtering on billing code type */
+as (
+--- bring the original records + normalized percentage rates together
+select 
+  inn_payer_file_group_id,
+  mrf_payer_name,
+  raw_payer_name,
+  Plan_Name,
+  Plan_Name_level_2,
+  raw_plan_name,
+  inn_month,
+  inn_year,
+  last_updated_on,
+  billing_code_type,
+  billing_code,
+  billing_code_description,
+  billing_code_category_level1,
+  billing_code_category_level2,
+  negotiation_arrangement,
+  place_of_service_code,
+  place_of_service_name,
+  npi_name,
+  system_name,
+  zip_code,
+  state_code,
+  city_name,
+  geo_address_latitude_number,
+  geo_address_logitude_number,
+  msa_cbsa_description,
+  fips_cnty_desc,
+  cot_clas_desc,
+  cot_fclt_typ_desc,
+  cot_spcl_desc,
+  Licensed_Bed_Count_Range,
+  Medicare_Rate,
+  client_name,
+  msa_code,
+  org_ccn_id,
+  source_id,
+  negotiated_type,
+  additional_information,
+  additional_payer_notes,
+  negotiated_rate,
+  min_negotiated_rate,
+  max_negotiated_rate,
+  CASE 
+    when lower(negotiated_type) like '%percentage%' and lower(negotiated_type) not like '%adjusted%' then null
+    when lower(negotiated_type) like '%per diem%' and lower(negotiated_type) not like '%mrf adjusted%' then null
+    WHEN Neg_Rate_Distinct_Cnt = 1 THEN "High"
+    WHEN Neg_Rate_Distinct_Cnt > 1 AND Neg_Rate_Distinct_Cnt <= 4 then "Medium"
+    WHEN Neg_Rate_Distinct_Cnt > 4 THEN "Low"
+    ELSE "NA"
+  END AS uniqueness_confidence
+from add_adjusted_per_diem_rates_"""||row.billing_class_value||"""
+
+union all
+
+select
+  inn_payer_file_group_id,
+  mrf_payer_name,
+  raw_payer_name,
+  Plan_Name,
+  Plan_Name_level_2,
+  raw_plan_name,
+  inn_month,
+  inn_year,
+  last_updated_on,
+  billing_code_type,
+  billing_code,
+  billing_code_description,
+  billing_code_category_level1,
+  billing_code_category_level2,
+  negotiation_arrangement,
+  place_of_service_code,
+  place_of_service_name,
+  npi_name,
+  system_name,
+  zip_code,
+  state_code,
+  city_name,
+  geo_address_latitude_number,
+  geo_address_logitude_number,
+  msa_cbsa_description,
+  fips_cnty_desc,
+  cot_clas_desc,
+  cot_fclt_typ_desc,
+  cot_spcl_desc,
+  Licensed_Bed_Count_Range,
+  Medicare_Rate,
+  client_name,
+  msa_code,
+  org_ccn_id,
+  source_id,
+  negotiated_type,
+  additional_information,
+  additional_payer_notes,
+  negotiated_rate,
+  min_negotiated_rate,
+  max_negotiated_rate,
+  CASE 
+    when lower(negotiated_type) like '%percentage%' and lower(negotiated_type) not like '%adjusted%' then null
+    when lower(negotiated_type) like '%per diem%' and lower(negotiated_type) not like '%mrf adjusted%' then null
+    WHEN Neg_Rate_Distinct_Cnt = 1 THEN "High"
+    WHEN Neg_Rate_Distinct_Cnt > 1 AND Neg_Rate_Distinct_Cnt <= 4 then "Medium"
+    WHEN Neg_Rate_Distinct_Cnt > 4 THEN "Low"
+    ELSE "NA"
+  END AS uniqueness_confidence
+from percentage_to_dollar_conversion_"""||row.billing_class_value||"""
+)
+""";
+end if;
+
+--- create a temp table to store the information after adding client specific data
+--- Adding new logic to add client specific common data like top codes and exclusions to the base data
+execute immediate """create temp table if not exists add_client_data_"""||row.billing_class_value||""" as 
+(
+  --- bring the CPT/HCPCS top codes by joining on billing code
+  --- and set the top codes flag to Y for the codes available in the top codes table
+  select data.*, 
+  case 
+  when top.billing_code is not null then "Y"
+  else "N"
+  end as top_codes_flag,
+  "N" as exclusion_flag
+  from (select * from combined_data_"""||row.billing_class_value||""" 
+  where billing_code_type = "CPT/HCPCS"
+  ) data
+  --- bring the top codes and create the top codes flag
+  left join (select * from MRF_Payer_Analytical_"""||client_name||""".mrf_client_top_codes 
+  where billing_code_type = "CPT/HCPCS"
+  ) top  
+  using (billing_code)
+
+  union all 
+
+  --- bring the remaining top codes by joining on billing code and billing code type 
+  --- and set the top codes flag to Y for the codes available in the top codes table
+  --- and adding left join to populate the top codes flag from billing code deatils table
+  select data.*, 
+  case 
+  when top.billing_code is not null then "Y"
+  when ref.top_code = "Y" then "Y"
+  else "N"
+  end as top_codes_flag,
+  case ref.exclusion
+    when "Y" then  "Y"
+    else "N"
+    end as exclusion_flag,
+  from (select * from combined_data_"""||row.billing_class_value||""" 
+  where billing_code_type <> "CPT/HCPCS"
+  ) data
+  --- bring the top codes and create the top codes flag
+  left join (select * from MRF_Payer_Analytical_"""||client_name||""".mrf_client_top_codes 
+  where billing_code_type <> "CPT/HCPCS"
+  ) top
+  using (billing_code_type, billing_code)
+  left join ( select distinct billing_code,billing_code_type,top_code,exclusion from MRF_Payer_Reference.mrf_rfrnc_billing_code_dtls where active_ind = true ) ref
+  using (billing_code_type, billing_code)
+)""";
+
+-- Creting new table negotiated_rates_median which contains all the billing
+
+-- execute immediate """create or replace  temp table negotiated_rates_median_"""||row.billing_class_value||"""
+-- cluster by billing_code,billing_code_type
+-- as
+-- with rdm as (
+--   select distinct 
+--     a.mrf_hsptl_dtl_unique_file_id,
+--     d.*,
+--     e.last_updated_on,
+--     case when d.stndrd_ngtd_charge_prcntg>0 and d.stndrd_ngtd_charge_prcntg<=1 then stndrd_ngtd_charge_prcntg*gross_charge when d.stndrd_ngtd_charge_prcntg>1 and d.stndrd_ngtd_charge_prcntg<=1000 then (stndrd_ngtd_charge_prcntg*gross_charge/100) when d.stndrd_ngtd_charge_prcntg>1000 then (stndrd_ngtd_charge_prcntg*gross_charge/10000) end as percentage_rate,
+--     a.gross_charge,
+--     b.billing_code,
+--   b.billing_code_type
+--   FROM     
+--         `MRF_Provider_Relational.mrf_hsptl_dtl_stndrd_charges` a
+--   join `MRF_Provider_Relational.mrf_hsptl_dtl` e
+--   on a.mrf_hsptl_dtl_unique_file_id=e.mrf_hsptl_dtl_unique_file_id
+--   JOIN  `MRF_Provider_Relational.mrf_hsptl_dtl_blng_code_info` b
+--     ON a.stndrd_charges_info_object_id = b.stndrd_charges_info_object_id
+--   JOIN `MRF_Provider_Relational.mrf_hsptl_dtl_standrd_charges_payer_ngtd_rate` d
+--     ON a.payer_information_id = d.payer_information_id
+--     AND a.stndrd_charges_info_object_id = d.stndrd_charges_info_object_id
+--   WHERE EXTRACT(YEAR FROM e.last_updated_on) >= 2024
+-- ),
+-- final AS (
+--   SELECT 
+--     last_updated_on,
+--     billing_code, 
+--   billing_code_type,
+-- case 
+--     when lower(methodology) = 'percent of total billed charges' then 
+--         case 
+--             when coalesce(
+--                 if(stndrd_ngtd_charge_dollar<999999999 and stndrd_ngtd_charge_dollar>0, stndrd_ngtd_charge_dollar, null),
+--                 if(percentage_rate > 0, percentage_rate, null),
+--                 if(estimated_amount<999999999, estimated_amount, 0)
+--             ) > 0 then 'Adjusted (Percentage)'
+--             else 'Percentage'
+--         end
+--     when lower(methodology) = 'fee schedule' and coalesce(
+--         if(stndrd_ngtd_charge_dollar<999999999 and stndrd_ngtd_charge_dollar>0, stndrd_ngtd_charge_dollar, null), if(estimated_amount<999999999, estimated_amount, 0)) >0 then 'Negotiated'
+--     else initcap(methodology)
+-- end as negotiated_type,
+
+-- case 
+--     when lower(methodology) = 'percent of total billed charges' then 
+--         coalesce(
+--             if(stndrd_ngtd_charge_dollar<999999999 and stndrd_ngtd_charge_dollar>0, stndrd_ngtd_charge_dollar, null),
+--             if(percentage_rate > 0, percentage_rate, null),
+--             if(estimated_amount<999999999 and estimated_amount>0, estimated_amount, null)
+--         )
+--     when coalesce(
+--         if(stndrd_ngtd_charge_dollar<999999999 and stndrd_ngtd_charge_dollar>0, stndrd_ngtd_charge_dollar, null),
+--         if(estimated_amount<999999999 and estimated_amount>0, estimated_amount, null)
+--     ) is not null then 
+--         coalesce(
+--             if(stndrd_ngtd_charge_dollar<999999999 and stndrd_ngtd_charge_dollar>0, stndrd_ngtd_charge_dollar, null),
+--             estimated_amount
+--         )
+-- end as negotiated_rate
+--   FROM rdm
+--   where billing_code in (select distinct billing_code from combined_data_"""||row.billing_class_value||""")
+-- ),
+
+-- transformed_billing_codes as (
+--   select 
+--   last_updated_on,
+--   billing_code_type,
+--   negotiated_rate,
+
+--       CASE
+--         WHEN billing_code_type = 'MS-DRG' THEN 
+--             CASE
+--                 WHEN REGEXP_CONTAINS(billing_code, r'\\d{1,3}') THEN 
+--                     LPAD(REGEXP_EXTRACT(billing_code, r'(\\d{1,3})'), 3, '0')
+--                 ELSE 
+--                     REGEXP_EXTRACT(billing_code, r'(\\d{3})')
+--             END
+--         WHEN billing_code_type = 'APC' THEN 
+--     CASE
+--         WHEN REGEXP_CONTAINS(billing_code, r'(\\d{4,5})$') THEN 
+--             LPAD(REGEXP_EXTRACT(billing_code, r'(\\d{4,5})$'), 5, '0')
+--         WHEN REGEXP_CONTAINS(billing_code, r'(\\d{1,3})$') THEN 
+--             LPAD(REGEXP_EXTRACT(billing_code, r'(\\d{1,3})$'), 5, '0')
+--         ELSE 
+--             LPAD(REGEXP_EXTRACT(billing_code, r'(\\d{5})$'), 5, '0')
+--     END
+
+--         WHEN billing_code_type = 'CPT/HCPCS' THEN 
+--             CASE
+--                 -- Priority 1: Standard 5-digit codes at beginning (CPT priority)
+--                 WHEN REGEXP_CONTAINS(billing_code, r'^[\\d]{5}') THEN 
+--                     REGEXP_EXTRACT(billing_code, r'^(\\d{5})')
+                    
+--                 -- Priority 2: HCPCS alphanumeric codes (letter + 4 digits)
+--                 WHEN REGEXP_CONTAINS(billing_code, r'[A-Z]\\d{4}') THEN 
+--                     REGEXP_EXTRACT(billing_code, r'([A-Z]\\d{4})')
+                    
+--                 -- Priority 3: Short numeric codes at beginning with padding
+--                 WHEN REGEXP_CONTAINS(billing_code, r'^[\\d]{1,4}') THEN 
+--                     LPAD(REGEXP_EXTRACT(billing_code, r'^(\\d{1,4})'), 5, '0')
+                    
+--                 -- Priority 4: 5-digit codes at end
+--                 WHEN REGEXP_CONTAINS(billing_code, r'\\d{5}$') THEN 
+--                     REGEXP_EXTRACT(billing_code, r'(\\d{5})$')
+                    
+--                 -- Priority 5: Short numeric codes at end with padding
+--                 WHEN REGEXP_CONTAINS(billing_code, r'(\\d{1,4})$') THEN 
+--                     LPAD(REGEXP_EXTRACT(billing_code, r'(\\d{1,4})$'), 5, '0')
+                    
+--                 ELSE 
+--                     billing_code
+--             END
+--         WHEN billing_code_type = 'NDC' THEN 
+--             CASE
+--                 WHEN REGEXP_CONTAINS(billing_code, r'(\\d{4,5}-\\d{4}-\\d{2})') THEN 
+--                     REGEXP_EXTRACT(billing_code, r'(\\d{4,5}-\\d{4}-\\d{2})')
+--                 ELSE 
+--                     billing_code
+--             END
+--         ELSE 
+--             billing_code
+--     END AS billing_code, 
+--     negotiated_type
+--   from final
+
+-- ),
+
+-- avg_length_of_stay AS (
+-- SELECT distinct lpad(ltrim(ms_drg,'0'),3,'0') as drg_code, AVG(CAST(geometric_mean_los AS FLOAT64)) AS avg_los,
+-- version_open_date, version_close_date
+-- FROM `MRF_Payer_Reference.mrf_rfrnc_cms_los_data`
+-- GROUP BY drg_code, version_open_date, version_close_date)
+-- ,
+
+-- payer_rdm as (
+-- select distinct b.last_updated_on, billing_code_type,negotiated_rate,billing_code,negotiated_type from
+-- `MRF_Payer_Relational.mrf_inn_ngtd_prc` a
+-- join `MRF_Payer_Relational.mrf_inn` b
+-- on a.inn_id=b.inn_id
+-- where a.active_ind = true 
+-- and billing_class = '"""||row.billing_class_value||"""'
+-- and a.billing_code IN ( SELECT DISTINCT billing_code 
+--     FROM `combined_data_"""||row.billing_class_value||"""` )
+-- and EXTRACT(YEAR FROM b.last_updated_on) >= 2024
+-- ),
+
+-- payer_provider_combined_final as (
+-- select * except(last_updated_on)
+-- from transformed_billing_codes
+-- where lower(negotiated_type) NOT IN ('percentage', 'per diem')
+
+-- union all 
+
+-- (select distinct 
+-- a.billing_code_type,a.negotiated_rate*c.avg_los as negotiated_rate,a.billing_code,'MRF Adjusted (Per Diem)' as negotiated_type
+-- from transformed_billing_codes a LEFT JOIN avg_length_of_stay c ON a.billing_code = c.drg_code and a.last_updated_on between c.version_open_date and c.version_close_date  
+-- where lower(a.billing_code_type) = "ms-drg" AND lower(a.negotiated_type) = "per diem")
+
+-- union all
+
+-- select * except(last_updated_on)
+-- from payer_rdm
+-- where lower(negotiated_type) NOT IN ('percentage', 'per diem')
+
+-- union all 
+
+-- (select distinct a.billing_code_type,a.negotiated_rate*c.avg_los as negotiated_rate,a.billing_code,'MRF Adjusted (Per Diem)' as negotiated_type
+-- from payer_rdm a LEFT JOIN avg_length_of_stay c ON a.billing_code = c.drg_code and a.last_updated_on between c.version_open_date and c.version_close_date 
+-- where lower(a.billing_code_type) = "ms-drg" AND lower(a.negotiated_type) = "per diem")
+-- )
+
+-- --- Calculation without CPT and HCPCS
+
+-- SELECT DISTINCT
+--     PERCENTILE_CONT(CAST(negotiated_rate AS NUMERIC), 0.12) OVER (PARTITION BY billing_code_type,billing_code )  AS q1,
+--     PERCENTILE_CONT(CAST(negotiated_rate AS NUMERIC), 0.25) OVER (PARTITION BY billing_code_type,billing_code )  AS q2,
+--     PERCENTILE_CONT(CAST(negotiated_rate AS NUMERIC), 0.75) OVER (PARTITION BY billing_code_type,billing_code )  AS q3,
+--     PERCENTILE_CONT(CAST(negotiated_rate AS NUMERIC), 0.87) OVER (PARTITION BY billing_code_type,billing_code )  AS q4,
+--     PERCENTILE_CONT(CAST(negotiated_rate AS NUMERIC), 0.50) OVER (PARTITION BY billing_code_type,billing_code )  AS median_Rate,
+--     billing_code,
+--   billing_code_type
+-- FROM payer_provider_combined_final
+-- WHERE negotiated_rate IS NOT NULL 
+--   AND negotiated_rate > 1 
+--   AND negotiated_rate < 999999999
+
+
+-- """;
+
+  call `MRF_Payer_Extract.save_current_final_extract_version`(client_name, row.billing_class_value);
+
+execute immediate """drop table if exists MRF_Payer_Analytical_"""||client_name||""".mrf_final_extract_"""||row.billing_class_value||"""
+""";
+execute immediate """create or replace table MRF_Payer_Analytical_"""||client_name||""".mrf_final_extract_"""||row.billing_class_value||"""
+cluster by npi_name, billing_code_type, mrf_payer_name, system_name
+as(
+with add_medicare_average as (
+select data.* except(msa_code, org_ccn_id), 
+--- for any non-drg codes i.e. codes coming from addendum-b, multiply with wage index
+case billing_code_type
+when "MS-DRG" then coalesce(bus_nm_avg, cbsa_avg, state_avg, national_avg)
+else coalesce(bus_nm_avg, cbsa_avg, state_avg, national_avg) * wage_index
+end as Medicare_Allowed_amount,
+--- create and populate new columns for additional information data
+REGEXP_EXTRACT(additional_information, r'age\\[(\\d+-\\d+)\\]') AS add_info_Age, REGEXP_EXTRACT(additional_information, r'days\\[(\\d+-\\d+)\\]') AS add_info_Days, REGEXP_EXTRACT(additional_information, r'gender\\[(.*?)\\]') AS add_info_Gender, ARRAY_TO_STRING(REGEXP_EXTRACT_ALL(additional_information, r'RC\\[(\\d+-\\d+)\\]'),', ') AS add_info_RC, REGEXP_EXTRACT(additional_information, r'APC\\[(\\d+-\\d+)\\]') AS add_info_APC,
+-- create flag to detect presence of the value ‘outlier’ in the additional_information field
+CASE WHEN LOWER(additional_information) LIKE '%outlier%' THEN 'Yes' ELSE 'No' END AS add_info_Outlier_Flag,
+
+--- for drg codes i.e. codes coming from lds, trend it forward to 2023, 2024, 2025
+--case 
+--when billing_code_type = "MS-DRG" and inn_year = 2025 then coalesce(bus_nm_avg, cbsa_avg ,state_avg, national_avg) * 1.038 * 1.029 * 1.025 * 1.043 * 1.031 * 1.029
+--when billing_code_type = "MS-DRG" and inn_year = 2024 then coalesce(bus_nm_avg, cbsa_avg ,state_avg, national_avg) * 1.038 * 1.029 * 1.025 * 1.043 * 1.031 
+--when billing_code_type = "MS-DRG" then coalesce(bus_nm_avg, cbsa_avg ,state_avg, national_avg) * 1.038 * 1.029 * 1.025 * 1.043
+--else coalesce(bus_nm_avg, cbsa_avg, state_avg, national_avg) * wage_index
+--end as Current_Medicare_Allowed_amount,
+--region, priority
+
+case 
+when billing_code_type = "MS-DRG" and inn_year = 2025 then coalesce(bus_nm_avg, cbsa_avg ,state_avg, national_avg) * 1.043 * 1.031 * 1.029
+when billing_code_type = "MS-DRG" and inn_year = 2024 then coalesce(bus_nm_avg, cbsa_avg ,state_avg, national_avg) * 1.043 * 1.031 
+when billing_code_type = "MS-DRG" then coalesce(bus_nm_avg, cbsa_avg ,state_avg, national_avg) * 1.043
+else coalesce(bus_nm_avg, cbsa_avg, state_avg, national_avg) * wage_index
+end as Current_Medicare_Allowed_amount,
+region, priority
+from add_client_data_"""||row.billing_class_value||""" data
+
+--- get the wage index
+left join (select distinct CAST(provider_number AS STRING) as org_ccn_id, fy_2023_wage_index as wage_index
+from MRF_Payer_Staging.stg_FY_2023_IPPS_FR_and_CA_Impact_File
+)
+using (org_ccn_id)
+
+--- business name level  medicare averages
+left join (select distinct billing_code, npi_name, bus_nm_avg, vrsn_open_date, vrsn_close_date
+from medicare_averages
+) t1
+on data.billing_code=t1.billing_code and data.npi_name=t1.npi_name and data.last_updated_on BETWEEN t1.vrsn_open_date AND t1.vrsn_close_date
+
+--- cbsa level medicare averages
+left join (select distinct billing_code, msa_code, cbsa_avg, vrsn_open_date, vrsn_close_date
+from medicare_averages
+) t2
+on data.billing_code=t2.billing_code and data.msa_code=t2.msa_code and data.last_updated_on BETWEEN t2.vrsn_open_date AND t2.vrsn_close_date
+
+--- state level medicare averages
+left join (select distinct billing_code, state_code, state_avg, vrsn_open_date, vrsn_close_date
+from medicare_averages
+) t3
+on data.billing_code=t3.billing_code and data.state_code=t3.state_code and data.last_updated_on BETWEEN t3.vrsn_open_date AND t3.vrsn_close_date
+
+--- national level medicare averages
+left join (select distinct billing_code, national_avg, vrsn_open_date, vrsn_close_date
+from medicare_averages
+) t4
+on data.billing_code=t4.billing_code and data.last_updated_on BETWEEN t4.vrsn_open_date AND t4.vrsn_close_date
+
+--- bring the region and priority for each hospital
+left join `MRF_Payer_Analytical_"""||client_name||""".mrf_client_hospital_region_priority` rp
+on ifnull(data.npi_name, "")=ifnull(rp.npi_name, "")
+and ifnull(data.system_name,"")=ifnull(rp.system_name, "")
+and ifnull(data.city_name, "")=ifnull(rp.city_name, "")
+and ifnull(data.state_code, "")=ifnull(rp.state_code, "")
+and ifnull(data.org_ccn_id, "")=ifnull(rp.org_ccn_id, "")
+
+),
+--- calculate percent of medicare and bring in volume, median iqr method for outlier confidence, truven and komodo percentage difference, benchmarking confidence
+
+zscore_medicare_volume as (select data.*,
+safe_divide(negotiated_rate, Current_Medicare_Allowed_amount) * 100 as Percent_Of_Medicare_Avg_Allowed,
+volume,client_billing_category_1,client_billing_category_2,client_billing_category_3,
+case
+when lower(negotiated_type) like '%percentage%' and lower(negotiated_type) not like '%adjusted%' then null /* exclude confidence logic for percentage and per diem records */
+when lower(negotiated_type) like '%per diem%' and lower(negotiated_type) not like '%mrf adjusted%' then null
+when negotiated_rate >= q2 AND negotiated_rate < q3 THEN 'High'
+when (negotiated_rate >= q1 AND negotiated_rate < q2) or (negotiated_rate >= q3 AND negotiated_rate <= (median_rate + (2 * (q4 - q1)))) then 'Medium'
+when negotiated_rate < q1 OR negotiated_rate > (median_rate + (2 * (q4 - q1))) then 'Low'
+else null
+end as outlier_confidence,
+/* Adding  logic to populate the anomalous_rate_flag  */
+case when dbscan.DBSCAN_hyper_outlier_count > 0 and data.negotiated_rate between dbscan.dbscan_hyper_low and dbscan.dbscan_hyper_high then 'N'
+    when dbscan.DBSCAN_hyper_outlier_count = 0 and data.negotiated_rate between dbscan.dbscan_hyper_low and dbscan.dbscan_hyper_high then 'iqr'
+    when data.negotiated_rate > dbscan.dbscan_hyper_high or data.negotiated_rate < dbscan.dbscan_hyper_low then 'Y'
+    else 'N/A'
+  end as anomalous_rate_flag_iqr,
+if((lower(negotiated_type) like "%percentage%" or lower(negotiated_type) like "%per diem%") and (lower(negotiated_type) not like '%adjusted%'), null, round(safe_divide((data.negotiated_rate - trdata.allowed_per_admit) , trdata.allowed_per_admit),2)) as truven_percent_diff, /* exclude confidence logic for percentage and per diem records */
+if((lower(negotiated_type) like "%percentage%" or lower(negotiated_type) like "%per diem%") and (lower(negotiated_type) not like '%adjusted%'), null, round(safe_divide((data.negotiated_rate - trdata_all.allowed_per_admit_all) , trdata_all.allowed_per_admit_all),2)) as truven_percent_diff_all,
+if((lower(negotiated_type) like "%percentage%" or lower(negotiated_type) like "%per diem%") and (lower(negotiated_type) not like '%adjusted%'), null, round(safe_divide((data.negotiated_rate - kdata.allowed_per_admit) , kdata.allowed_per_admit),2)) as komodo_percent_diff, /* exclude confidence logic for percentage and per diem records */
+if((lower(negotiated_type) like "%percentage%" or lower(negotiated_type) like "%per diem%") and (lower(negotiated_type) not like '%adjusted%'), null, round(safe_divide((data.negotiated_rate - kdata_all.allowed_per_admit_all) , kdata_all.allowed_per_admit_all),2)) as komodo_percent_diff_all 
+
+from add_medicare_average data
+left join (
+select client_payer as mrf_payer_name, client_plan as Plan_Name, client_billing_code as billing_code, sum(client_facility_volume) as volume
+from `MRF_Payer_Analytical_"""||client_name||""".mrf_client_utilization`
+where client_billing_class = '"""||row.billing_class_value||"""'
+group by client_payer, client_plan, client_billing_code
+) utl
+on data.mrf_payer_name=utl.mrf_payer_name
+and data.Plan_name=utl.Plan_Name
+and data.billing_code=utl.billing_code
+left join ( 
+select billing_code,
+      coalesce(client_billing_code_category_level1,billing_code_category_level1) as client_billing_category_1,
+      coalesce(client_billing_code_category_level2,billing_code_category_level2) as client_billing_category_2,
+      coalesce(client_billing_code_category_level3,billing_code_category_level3) as client_billing_category_3 
+      from `MRF_Payer_Analytical_"""||client_name||""".mrf_client_billing_code_mapping`
+where billing_class = '"""||row.billing_class_value||"""'
+) code_data
+on data.billing_code=code_data.billing_code
+left join (select billing_code, state_code, avg(current_allowed_per_admit) as allowed_per_admit, version_open_date, version_close_date from MRF_Payer_Reference.mrf_rfrnc_truven_data  group by billing_code, state_code,version_open_date, version_close_date) trdata
+on data.billing_code=trdata.billing_code and data.state_code=trdata.state_code and data.last_updated_on BETWEEN trdata.version_open_date AND trdata.version_close_date
+
+left join (select billing_code, state_code, avg(adj_allowed_per_admit) as allowed_per_admit,version_open_date, version_close_date from MRF_Payer_Reference.mrf_rfrnc_komodo_data  group by billing_code, state_code, version_open_date, version_close_date) kdata
+on data.billing_code=kdata.billing_code and data.state_code=kdata.state_code and data.last_updated_on BETWEEN kdata.version_open_date AND kdata.version_close_date
+
+-- Adding new joins to get national averages (without state_code filtering)
+left join (select billing_code, avg(current_allowed_per_admit) as allowed_per_admit_all, version_open_date, version_close_date 
+from `MRF_Payer_Reference.mrf_rfrnc_truven_data`
+group by billing_code, version_open_date, version_close_date
+) trdata_all
+on data.billing_code=trdata_all.billing_code
+and data.last_updated_on BETWEEN trdata_all.version_open_date AND trdata_all.version_close_date
+ 
+left join (select billing_code, avg(adj_allowed_per_admit) as allowed_per_admit_all, version_open_date, version_close_date 
+from `MRF_Payer_Reference.mrf_rfrnc_komodo_data`  
+group by billing_code, version_open_date, version_close_date
+) kdata_all
+on data.billing_code=kdata_all.billing_code
+and data.last_updated_on BETWEEN kdata_all.version_open_date AND kdata_all.version_close_date
+
+-- left join negotiated_rates_median_"""||row.billing_class_value||""" med
+left join `MRF_Payer_Reference.negotiated_rates_median_approx` med
+/* Adding  join to median  table to populate the outlier confidence also handling 'CPT' and 'HCPCS' type into single 'CPT/HCPCS'  */
+on data.billing_code=med.billing_code
+and  
+data.billing_code_type = med.billing_code_type 
+
+/* Adding  join to dbscan result table to populate the anomalous_rate_flag  */
+left join MRF_Payer_Reference.mrf_dbscan_billing_code_result dbscan
+on data.billing_code = dbscan.billing_code
+AND 
+data.billing_code_type = dbscan.billing_code_type
+),
+benchmarking_confidence as (
+select data.*except(truven_percent_diff,komodo_percent_diff,anomalous_rate_flag_iqr,truven_percent_diff_all,komodo_percent_diff_all),
+
+-- Updated confidence calculation to use fallback when state-specific data is null and percent diff is null
+case
+  when abs(truven_percent_diff) <= 0.2 then 'High'
+  when abs(truven_percent_diff) > 0.2 and abs(truven_percent_diff) <= 0.6 then 'Medium'
+  when abs(truven_percent_diff) > 0.6 then 'Low'
+  when truven_percent_diff is null and abs(truven_percent_diff_all) <= 0.2 then 'High'
+  when truven_percent_diff is null and abs(truven_percent_diff_all) > 0.2 and abs(truven_percent_diff_all) <= 0.6 then 'Medium'
+  when truven_percent_diff is null and abs(truven_percent_diff_all) > 0.6 then 'Low'
+  else null
+end as truven_confidence,
+
+case
+  when abs(komodo_percent_diff) <= 0.2 then 'High'
+  when abs(komodo_percent_diff) > 0.2 and abs(komodo_percent_diff) <= 0.6 then 'Medium'
+  when abs(komodo_percent_diff) > 0.6 then 'Low'
+  when komodo_percent_diff is null and abs(komodo_percent_diff_all) <= 0.2 then 'High'
+  when komodo_percent_diff is null and abs(komodo_percent_diff_all) > 0.2 and abs(komodo_percent_diff_all) <= 0.6 then 'Medium'
+  when komodo_percent_diff is null and abs(komodo_percent_diff_all) > 0.6 then 'Low'
+  else null
+end as komodo_confidence,
+
+--- shoppable services are only for cpt, hcpcs and drg codes
+--- the following case statement is used to prevent the flag being set for other code types which overlap with cpt, hcpcs and drg codes
+case when billing_code_type in ("CPT/HCPCS", "MS-DRG") and shoppable.billing_code is not null then 'Y'
+else 'N'
+end as shoppable_service_flag,
+--- added logic to populate the anomalous_rate_flag based on the confidence level for which dbscan result is not correct
+case when anomalous_rate_flag_iqr = 'iqr' and outlier_confidence in ('High' , 'Medium') then 'N'
+    when anomalous_rate_flag_iqr = 'iqr' and  (outlier_confidence = 'Low' or outlier_confidence is null) then 'Y' 
+    else anomalous_rate_flag_iqr
+end as anomalous_rate_flag
+from zscore_medicare_volume data
+left join `MRF_Payer_Reference.mrf_rfrnc_cms_shoppable_services` shoppable
+on data.billing_code = shoppable.billing_code
+and data.last_updated_on between shoppable.version_open_date and shoppable.version_close_date /* join to the shoppable services which are available at the time of publishing of file */
+),
+
+-- Added logic to calculate outlier_confidence_Score , uniqueness_confidence_Score , outlier_weight,benchmarking_weight,uniqueness_weight logic
+Score_Cal as (
+select *except(truven_confidence,komodo_confidence),
+case
+when """||use_komodo||""" = false then truven_confidence /* directly use truven confidence as the final benchmarking confidence if use of Komodo data is not allowed */
+when truven_confidence in ('High','Medium') then truven_confidence
+when truven_confidence="Low" and komodo_confidence is null then truven_confidence
+when truven_confidence="Low" and komodo_confidence is not null then komodo_confidence
+else komodo_confidence
+end as benchmarking_confidence,
+CASE WHEN outlier_confidence = 'High' then 3
+when outlier_confidence = 'Medium' then 2
+When outlier_confidence = 'Low' then 1
+else null end as outlier_confidence_Score,
+CASE WHEN uniqueness_confidence = 'High' then 3
+when uniqueness_confidence = 'Medium' then 2
+When uniqueness_confidence = 'Low' then 1
+else null end as uniqueness_confidence_Score,
+0.4 AS outlier_weight, /* Updating the outlier weightage from 30 percent to 40 percent */
+0.55 AS benchmarking_weight, /* Updating the outlier weightage from 65 percent to 55 percent */
+0.05 as uniqueness_weight																															
+from benchmarking_confidence),
+Scoring_DS as 
+(select *,
+CASE WHEN benchmarking_confidence = 'High' then 3
+when benchmarking_confidence = 'Medium' then 2
+When benchmarking_confidence = 'Low' then 1
+else null end as benchmarking_confidence_score
+from Score_Cal
+),
+-- Added logic to calculate the numerator and denominator part of Overall_Confidence_Score
+Overall_Conf_ND as (
+select *except(outlier_confidence_score,outlier_weight,benchmarking_confidence_score,benchmarking_weight,uniqueness_confidence_Score,uniqueness_weight),
+round(((coalesce(outlier_confidence_score,0.0) * outlier_weight) + (coalesce(benchmarking_confidence_score,0.0) * benchmarking_weight) + coalesce(uniqueness_confidence_Score,0) * uniqueness_weight ),2) as overall_conf_num,
+(if(outlier_confidence_score is not null, outlier_weight, 0.0) + if(benchmarking_confidence_score is not null, benchmarking_weight, 0.0) + if(uniqueness_confidence_Score is not null, uniqueness_weight,0.0))as overall_conf_den
+from Scoring_Ds
+),
+-- Added logic to calculate the Overall_Confidence_Score
+OC_Score_and_custom_bus_nm as (
+select tbl.* except(overall_conf_num,overall_conf_den),
+ROUND(safe_divide(overall_conf_num,overall_conf_den),2) AS Overall_Confidence_Score,
+--- if a custom grouping is available for a business name, use that. If not, use the original business name from the reference data.
+coalesce(client_provider_grouping, npi_name) as client_provider_grouping,
+---added a column max_rate_flag as true when row_num==1 and false when row_num!=1
+ROW_NUMBER() OVER (PARTITION BY billing_code, plan_name, billing_code_type, negotiated_type, client_provider_grouping ORDER BY negotiated_rate DESC) = 1 as max_rate_flag,
+--- set the flag as true if a custom business name was used instead of the standard business name
+--- this flag can be used in the dashboards to keep or remove records for which a custom business name is provided by the client
+client_provider_grouping is not null as client_provider_grouping_available_ind
+from Overall_Conf_ND tbl
+--- bring in the client business name mapping
+left join `MRF_Payer_Analytical_"""||client_name||""".mrf_client_bus_nm_mapping`
+on npi_name = client_bus_nm
+),
+overall_confidence_calculation as (
+-- Added logic to calculate the Overall_Confidence
+select *except(Overall_Confidence_Score),
+case 
+when lower(negotiated_type) like '%percentage%' and lower(negotiated_type) not like '%adjusted%' then null /* exclude confidence logic for percentage and per diem records */
+when lower(negotiated_type) like '%per diem%' and lower(negotiated_type) not like '%mrf adjusted%' then null
+when Overall_Confidence_Score >= 3 then '1-Excellent'
+when Overall_Confidence_Score >= 2.25 and Overall_Confidence_Score < 3 then '2-Good'
+when Overall_Confidence_Score >= 1.75 and Overall_Confidence_Score < 2.25 then '3-Fair'
+when Overall_Confidence_Score < 1.75 then '4-Poor'
+else 'NA' end as overall_confidence,
+client_provider_grouping as anchored_hospital
+from OC_Score_and_custom_bus_nm
+),
+hierarchy_ranking_values as (
+--- tag each overall_confidence value and each source_id value to an integer to be used for ranking them
+select *, 
+case overall_confidence
+when '1-Excellent' then 1
+when '2-Good' then 2
+when '3-Fair' then 3
+when '4-Poor' then 4
+else 5
+end as overall_confidence_rank,
+case source_id
+when 'payer' then 1
+when 'provider' then 2
+else 3
+end as source_id_rank
+from overall_confidence_calculation 
+)
+
+SELECT
+  * EXCEPT(billing_code_type),
+  CASE
+    WHEN """ || CAST(standardize_billing_code_flag AS STRING) || """ THEN
+
+      CASE
+        WHEN char_length(trim(billing_code)) = 5 AND billing_code_type IN ('CPT/HCPCS') THEN
+          IF(REGEXP_CONTAINS(trim(billing_code), r"^\\d{4}\\w$"), 'CPT',
+            IF(REGEXP_CONTAINS(trim(billing_code), r"^\\D\\w{4}$"), 'HCPCS', billing_code_type))
+        ELSE billing_code_type
+      END
+    ELSE billing_code_type
+  END AS billing_code_type
+FROM (
+  SELECT
+    * EXCEPT(overall_confidence_rank, source_id_rank),
+    DENSE_RANK() OVER (
+      PARTITION BY mrf_payer_name, plan_name, client_provider_grouping, billing_code_type, billing_code
+      ORDER BY overall_confidence_rank, source_id_rank
+    ) = 1 AS hierarchy_flag
+  FROM hierarchy_ranking_values
+));
+
+  """;
+    -- After creating the final extract table and audit table
+  -- Check if this is the institutional billing class and RC to DRG conversion is requested
+  IF row.billing_class_value = 'institutional' AND run_rc_to_drg = TRUE THEN
+    -- Call the RC to DRG conversion procedure to generate additional records
+    CALL `MRF_Payer_Extract.rc_to_drg_add_record_to_final_extract`(client_name, use_komodo);
+
+  END IF;
+
+  call `MRF_Payer_Extract.create_or_update_final_extract_audit_table`(client_name, row.billing_class_value);
+
+END FOR;
+
+END;
